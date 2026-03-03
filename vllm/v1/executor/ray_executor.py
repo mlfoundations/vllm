@@ -204,7 +204,12 @@ class RayDistributedExecutor(Executor):
             for bundle_id, bundle in enumerate(placement_group.bundle_specs):
                 if bundle.get(current_platform.ray_device_key, 0):
                     bundle_indices.append(bundle_id)
-            bundle_indices = bundle_indices[: self.parallel_config.world_size]
+            # For multi-DP with a shared placement group, each DP rank
+            # selects its own non-overlapping slice of bundles.
+            dp_rank = self.parallel_config.data_parallel_rank
+            ws = self.parallel_config.world_size
+            offset = dp_rank * ws
+            bundle_indices = bundle_indices[offset:offset + ws]
 
         worker_metadata: list[RayWorkerMetaData] = []
         driver_ip = get_ip()

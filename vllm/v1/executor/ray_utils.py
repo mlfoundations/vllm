@@ -310,6 +310,52 @@ def _wait_until_pg_removed(current_placement_group: "PlacementGroup"):
         time.sleep(wait_interval)
 
 
+def _get_or_create_named_pg(
+    name: str,
+    total_devices: int,
+    device_str: str,
+    max_retries: int = 30,
+) -> "PlacementGroup":
+    """Get or create a shared named placement group for multi-DP Ray.
+
+    Handles the race between DP ranks that start concurrently: one rank
+    creates the PG while the others wait and reuse it by name.
+    """
+    current_ip = get_ip()
+
+    for _attempt in range(max_retries):
+        # Try to find an existing PG created by another DP rank.
+        try:
+            pg = ray.util.get_placement_group(name)
+            logger.info("Reusing shared placement group '%s'", name)
+            _wait_until_pg_ready(pg)
+            return pg
+        except ValueError:
+            pass
+
+        # Try to create it ourselves.
+        try:
+            specs: list[dict[str, float]] = [
+                {device_str: 1.0} for _ in range(total_devices)
+            ]
+            specs[0][f"node:{current_ip}"] = 0.001
+            pg = ray.util.placement_group(specs, strategy="PACK", name=name)
+            logger.info(
+                "Created shared placement group '%s' with %d %ss",
+                name, total_devices, device_str,
+            )
+            _wait_until_pg_ready(pg)
+            return pg
+        except Exception:
+            # Another DP rank created it between our get and create.
+            time.sleep(0.5)
+
+    raise RuntimeError(
+        f"Failed to get or create placement group '{name}' "
+        f"after {max_retries} retries"
+    )
+
+
 def initialize_ray_cluster(
     parallel_config: ParallelConfig,
     ray_address: str | None = None,
@@ -401,43 +447,63 @@ def initialize_ray_cluster(
     else:
         logger.info("No current placement group found. Creating a new placement group.")
         num_devices_in_cluster = ray.cluster_resources().get(device_str, 0)
-        # Log a warning message and delay resource allocation failure response.
-        # Avoid immediate rejection to allow user-initiated placement group
-        # created and wait cluster to be ready
-        if parallel_config.world_size > num_devices_in_cluster:
-            logger.warning(
-                "The number of required %ss exceeds the total "
-                "number of available %ss in the placement group.",
-                device_str,
-                device_str,
-            )
-        # Create a new placement group
-        placement_group_specs: list[dict[str, float]] = [
-            {device_str: 1.0} for _ in range(parallel_config.world_size)
-        ]
 
-        # vLLM engine is also a worker to execute model with an accelerator,
-        # so it requires to have the device in a current node. Check if
-        # the current node has at least one device.
-        current_ip = get_ip()
-        current_node_id = ray.get_runtime_context().get_node_id()
-        current_node_resource = available_resources_per_node()[current_node_id]
-        if current_node_resource.get(device_str, 0) < 1:
-            raise ValueError(
-                f"Current node has no {device_str} available. "
-                f"{current_node_resource=}. vLLM engine cannot start without "
-                f"{device_str}. Make sure you have at least 1 {device_str} "
-                f"available in a node {current_node_id=} {current_ip=}."
-            )
-        # This way, at least bundle is required to be created in a current
-        # node.
-        placement_group_specs[0][f"node:{current_ip}"] = 0.001
+        dp_size = parallel_config.data_parallel_size
+        dp_rank = parallel_config.data_parallel_rank
 
-        # By default, Ray packs resources as much as possible.
-        current_placement_group = ray.util.placement_group(
-            placement_group_specs, strategy="PACK"
-        )
-        _wait_until_pg_ready(current_placement_group)
+        if dp_size > 1:
+            # For multi-DP with Ray, create a single shared placement group
+            # for ALL DP ranks so they don't race for GPU resources.  Use a
+            # named PG so the second EngineCore to arrive reuses the PG
+            # created by the first.
+            total_devices = parallel_config.world_size * dp_size
+            if total_devices > num_devices_in_cluster:
+                logger.warning(
+                    "Total required %ss across %d DP ranks (%d) exceeds "
+                    "cluster capacity (%d).",
+                    device_str, dp_size, total_devices, num_devices_in_cluster,
+                )
+
+            pg_name = "vllm_dp_shared_pg"
+            current_placement_group = _get_or_create_named_pg(
+                pg_name, total_devices, device_str,
+            )
+        else:
+            # Original single-DP-rank logic.
+            if parallel_config.world_size > num_devices_in_cluster:
+                logger.warning(
+                    "The number of required %ss exceeds the total "
+                    "number of available %ss in the placement group.",
+                    device_str,
+                    device_str,
+                )
+            # Create a new placement group
+            placement_group_specs: list[dict[str, float]] = [
+                {device_str: 1.0} for _ in range(parallel_config.world_size)
+            ]
+
+            # vLLM engine is also a worker to execute model with an accelerator,
+            # so it requires to have the device in a current node. Check if
+            # the current node has at least one device.
+            current_ip = get_ip()
+            current_node_id = ray.get_runtime_context().get_node_id()
+            current_node_resource = available_resources_per_node()[current_node_id]
+            if current_node_resource.get(device_str, 0) < 1:
+                raise ValueError(
+                    f"Current node has no {device_str} available. "
+                    f"{current_node_resource=}. vLLM engine cannot start without "
+                    f"{device_str}. Make sure you have at least 1 {device_str} "
+                    f"available in a node {current_node_id=} {current_ip=}."
+                )
+            # This way, at least bundle is required to be created in a current
+            # node.
+            placement_group_specs[0][f"node:{current_ip}"] = 0.001
+
+            # By default, Ray packs resources as much as possible.
+            current_placement_group = ray.util.placement_group(
+                placement_group_specs, strategy="PACK"
+            )
+            _wait_until_pg_ready(current_placement_group)
 
     assert current_placement_group is not None
     _verify_bundles(current_placement_group, parallel_config, device_str)
