@@ -310,50 +310,64 @@ def _wait_until_pg_removed(current_placement_group: "PlacementGroup"):
         time.sleep(wait_interval)
 
 
-def _get_or_create_named_pg(
-    name: str,
+def _get_or_create_dp_pg(
     total_devices: int,
     device_str: str,
     dp_rank: int,
     max_wait_sec: int = 120,
 ) -> "PlacementGroup":
-    """Get or create a shared named placement group for multi-DP Ray.
+    """Create or retrieve a shared placement group for multi-DP Ray.
 
-    Only DP rank 0 creates the placement group.  Other ranks poll
-    ``ray.util.get_placement_group(name)`` until it appears.  This
-    avoids the race where two ranks both try to create simultaneously.
+    DP rank 0 creates the PG and writes it (pickled) to a temp file.
+    Other ranks poll the file until it appears, then unpickle the
+    handle.  This avoids Ray named-PG visibility issues across forked
+    processes.
     """
+    import pickle
+    import tempfile
+
+    sync_file = os.path.join(tempfile.gettempdir(), "vllm_dp_pg_sync.pkl")
+
     if dp_rank == 0:
         current_ip = get_ip()
         specs: list[dict[str, float]] = [
             {device_str: 1.0} for _ in range(total_devices)
         ]
         specs[0][f"node:{current_ip}"] = 0.001
-        pg = ray.util.placement_group(specs, strategy="PACK", name=name)
+        pg = ray.util.placement_group(specs, strategy="PACK")
         logger.info(
-            "DP rank 0: created shared placement group '%s' with %d %ss",
-            name, total_devices, device_str,
+            "DP rank 0: created shared placement group with %d %ss",
+            total_devices, device_str,
         )
         _wait_until_pg_ready(pg)
+
+        # Write the PG handle for other DP ranks.
+        tmp = sync_file + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(pg, f)
+        os.replace(tmp, sync_file)  # atomic rename
+        logger.info("DP rank 0: wrote PG handle to %s", sync_file)
         return pg
 
-    # DP rank > 0: wait for rank 0's PG to appear.
+    # DP rank > 0: wait for rank 0 to write the PG handle.
     start = time.time()
     while time.time() - start < max_wait_sec:
-        try:
-            pg = ray.util.get_placement_group(name)
-            logger.info(
-                "DP rank %d: found shared placement group '%s'",
-                dp_rank, name,
-            )
-            _wait_until_pg_ready(pg)
-            return pg
-        except ValueError:
-            time.sleep(1)
+        if os.path.exists(sync_file):
+            try:
+                with open(sync_file, "rb") as f:
+                    pg = pickle.load(f)
+                logger.info(
+                    "DP rank %d: loaded shared PG from %s", dp_rank, sync_file,
+                )
+                _wait_until_pg_ready(pg)
+                return pg
+            except (EOFError, pickle.UnpicklingError):
+                pass  # File being written, retry
+        time.sleep(1)
 
     raise RuntimeError(
         f"DP rank {dp_rank}: timed out after {max_wait_sec}s waiting "
-        f"for placement group '{name}'"
+        f"for PG sync file {sync_file}"
     )
 
 
@@ -465,9 +479,8 @@ def initialize_ray_cluster(
                     device_str, dp_size, total_devices, num_devices_in_cluster,
                 )
 
-            pg_name = "vllm_dp_shared_pg"
-            current_placement_group = _get_or_create_named_pg(
-                pg_name, total_devices, device_str, dp_rank,
+            current_placement_group = _get_or_create_dp_pg(
+                total_devices, device_str, dp_rank,
             )
         else:
             # Original single-DP-rank logic.
