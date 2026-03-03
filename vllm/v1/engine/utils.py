@@ -209,15 +209,15 @@ def get_device_indices(
         value = ",".join(
             str(current_platform.device_id_to_physical_device_id(i))
             for i in range(
-                local_dp_rank * world_size,
-                local_dp_rank * world_size + local_world_size,
+                local_dp_rank * local_world_size,
+                (local_dp_rank + 1) * local_world_size,
             )
         )
     except IndexError as e:
         raise Exception(
             f"Error setting {device_control_env_var}: "
-            f"local range: [{local_dp_rank * world_size}, "
-            f"{(local_dp_rank + 1) * world_size}) "
+            f"local range: [{local_dp_rank * local_world_size}, "
+            f"{(local_dp_rank + 1) * local_world_size}) "
             "base value: "
             f'"{os.getenv(device_control_env_var)}"'
         ) from e
