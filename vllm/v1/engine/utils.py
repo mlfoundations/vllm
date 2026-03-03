@@ -185,16 +185,16 @@ def set_device_control_env_var(
     local_world_size = vllm_config.parallel_config.local_world_size
     evar = current_platform.device_control_env_var
 
-    # For Ray backend with multi-node PP, nnodes is fixed at 1 (Ray manages
-    # node discovery), so local_world_size = world_size = TP*PP which can
-    # exceed the actual number of GPUs on this node.  Fall back to the real
-    # device count so we don't index past CUDA_VISIBLE_DEVICES.
+    # For Ray backend, nnodes is forced to 1 (Ray manages node discovery
+    # internally), so local_world_size = world_size = TP*PP which can exceed
+    # the actual number of GPUs on this node.  With multi-node PP + DP, each
+    # DP rank's workers span remote nodes — local GPU partitioning is
+    # meaningless because Ray actors already have correct device assignments.
+    # Skip the CUDA_VISIBLE_DEVICES override entirely for Ray; the child
+    # EngineCore inherits the current env and Ray handles the rest.
     if vllm_config.parallel_config.use_ray:
-        device_env = os.environ.get(evar, "")
-        if device_env:
-            n_local_devices = len(device_env.split(","))
-            if local_world_size > n_local_devices:
-                local_world_size = n_local_devices
+        yield
+        return
 
     value = get_device_indices(evar, local_dp_rank, world_size, local_world_size)
     with patch.dict(os.environ, values=((evar, value),)):
