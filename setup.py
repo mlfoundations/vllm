@@ -20,7 +20,10 @@ from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 from setuptools.command.build_py import build_py
 from setuptools.command.develop import develop
-from setuptools_scm import get_version
+try:
+    from setuptools_scm import get_version
+except ImportError:
+    get_version = None
 from torch.utils.cpp_extension import CUDA_HOME, ROCM_HOME
 
 
@@ -875,10 +878,15 @@ def get_vllm_version() -> str:
     # wheels (e.g. CPU, TPU) without modifying the source.
     if env_version := os.getenv("VLLM_VERSION_OVERRIDE"):
         print(f"Overriding VLLM version with {env_version} from VLLM_VERSION_OVERRIDE")
-        os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
-        return get_version(write_to="vllm/_version.py")
+        if get_version is not None:
+            os.environ["SETUPTOOLS_SCM_PRETEND_VERSION"] = env_version
+            return get_version(write_to="vllm/_version.py")
+        return env_version
 
-    version = get_version(write_to="vllm/_version.py")
+    if get_version is not None:
+        version = get_version(write_to="vllm/_version.py")
+    else:
+        version = "0.16.0"
     sep = "+" if "+" not in version else "."  # dev versions might contain +
 
     if _no_device():
