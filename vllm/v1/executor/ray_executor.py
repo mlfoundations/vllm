@@ -313,14 +313,21 @@ class RayDistributedExecutor(Executor):
         n_nodes = len(node_workers)
 
         if n_nodes != n_ips:
-            raise RuntimeError(
-                f"Every node should have a unique IP address. Got {n_nodes}"
-                f" nodes with node ids {list(node_workers.keys())} and "
-                f"{n_ips} unique IP addresses {all_ips}. Please check your"
-                " network configuration. If you set `VLLM_HOST_IP`"
-                " environment variable, make sure it is unique for"
-                " each node."
-            )
+            # In multi-DP with a shared placement group, a DP rank's
+            # driver (EngineCore) may run on the head node while all its
+            # GPU workers are on different nodes.  The driver IP adds an
+            # extra entry to all_ips that has no corresponding node_id in
+            # node_workers.  Only fail if the worker-only counts mismatch.
+            worker_only_ips = set(worker_ips)
+            if len(worker_only_ips) != n_nodes:
+                raise RuntimeError(
+                    f"Every node should have a unique IP address. Got {n_nodes}"
+                    f" nodes with node ids {list(node_workers.keys())} and "
+                    f"{n_ips} unique IP addresses {all_ips}. Please check your"
+                    " network configuration. If you set `VLLM_HOST_IP`"
+                    " environment variable, make sure it is unique for"
+                    " each node."
+                )
 
         # Set environment variables for the driver and workers.
         # We set CUDA_VISIBLE_DEVICES to ALL GPUs on the node for each worker.

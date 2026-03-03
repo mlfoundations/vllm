@@ -314,45 +314,46 @@ def _get_or_create_named_pg(
     name: str,
     total_devices: int,
     device_str: str,
-    max_retries: int = 30,
+    dp_rank: int,
+    max_wait_sec: int = 120,
 ) -> "PlacementGroup":
     """Get or create a shared named placement group for multi-DP Ray.
 
-    Handles the race between DP ranks that start concurrently: one rank
-    creates the PG while the others wait and reuse it by name.
+    Only DP rank 0 creates the placement group.  Other ranks poll
+    ``ray.util.get_placement_group(name)`` until it appears.  This
+    avoids the race where two ranks both try to create simultaneously.
     """
-    current_ip = get_ip()
+    if dp_rank == 0:
+        current_ip = get_ip()
+        specs: list[dict[str, float]] = [
+            {device_str: 1.0} for _ in range(total_devices)
+        ]
+        specs[0][f"node:{current_ip}"] = 0.001
+        pg = ray.util.placement_group(specs, strategy="PACK", name=name)
+        logger.info(
+            "DP rank 0: created shared placement group '%s' with %d %ss",
+            name, total_devices, device_str,
+        )
+        _wait_until_pg_ready(pg)
+        return pg
 
-    for _attempt in range(max_retries):
-        # Try to find an existing PG created by another DP rank.
+    # DP rank > 0: wait for rank 0's PG to appear.
+    start = time.time()
+    while time.time() - start < max_wait_sec:
         try:
             pg = ray.util.get_placement_group(name)
-            logger.info("Reusing shared placement group '%s'", name)
-            _wait_until_pg_ready(pg)
-            return pg
-        except ValueError:
-            pass
-
-        # Try to create it ourselves.
-        try:
-            specs: list[dict[str, float]] = [
-                {device_str: 1.0} for _ in range(total_devices)
-            ]
-            specs[0][f"node:{current_ip}"] = 0.001
-            pg = ray.util.placement_group(specs, strategy="PACK", name=name)
             logger.info(
-                "Created shared placement group '%s' with %d %ss",
-                name, total_devices, device_str,
+                "DP rank %d: found shared placement group '%s'",
+                dp_rank, name,
             )
             _wait_until_pg_ready(pg)
             return pg
-        except Exception:
-            # Another DP rank created it between our get and create.
-            time.sleep(0.5)
+        except ValueError:
+            time.sleep(1)
 
     raise RuntimeError(
-        f"Failed to get or create placement group '{name}' "
-        f"after {max_retries} retries"
+        f"DP rank {dp_rank}: timed out after {max_wait_sec}s waiting "
+        f"for placement group '{name}'"
     )
 
 
@@ -466,7 +467,7 @@ def initialize_ray_cluster(
 
             pg_name = "vllm_dp_shared_pg"
             current_placement_group = _get_or_create_named_pg(
-                pg_name, total_devices, device_str,
+                pg_name, total_devices, device_str, dp_rank,
             )
         else:
             # Original single-DP-rank logic.
