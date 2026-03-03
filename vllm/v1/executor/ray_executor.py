@@ -384,6 +384,20 @@ class RayDistributedExecutor(Executor):
             driver_ip, get_open_port()
         )
 
+        # For multi-DP with Ray, set data_parallel_master_ip to the driver's
+        # routable IP.  parallel_state.py creates a single torch.distributed
+        # group spanning all DP ranks; the default 127.0.0.1 only works when
+        # every worker is co-located on one node.
+        if self.parallel_config.data_parallel_size > 1:
+            routable_ip = get_ip()
+            self.vllm_config.parallel_config.data_parallel_master_ip = (
+                routable_ip
+            )
+            logger.info(
+                "Set data_parallel_master_ip=%s for cross-DP init",
+                routable_ip,
+            )
+
         # Initialize the actual workers inside worker wrapper.
         all_kwargs = []
         for rank, (node_id, _) in enumerate(worker_node_and_gpu_ids):
