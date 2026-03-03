@@ -5,16 +5,43 @@ from typing import Any, cast
 
 import torch
 
-from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.config import (
+    VllmConfig,
+    get_layers_from_vllm_config,
+    resolve_layers_from_vllm_config,
+)
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend, CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
+    KVCacheGroupSpec,
     KVCacheSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.utils import AttentionGroup, bind_kv_cache
+
+logger = init_logger(__name__)
+
+
+def _prune_kv_cache_group_layers(
+    kv_cache_group_spec: KVCacheGroupSpec,
+    local_layer_names: list[str],
+) -> None:
+    """Prune a KV cache group to only contain layers present on this rank."""
+    if len(local_layer_names) == len(kv_cache_group_spec.layer_names):
+        return
+    kv_cache_group_spec.layer_names = local_layer_names
+    kv_cache_spec = kv_cache_group_spec.kv_cache_spec
+    if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
+        pruned_specs = {
+            name: kv_cache_spec.kv_cache_specs[name] for name in local_layer_names
+        }
+        kv_cache_group_spec.kv_cache_spec = UniformTypeKVCacheSpecs(
+            block_size=kv_cache_spec.block_size,
+            kv_cache_specs=pruned_specs,
+        )
 
 
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
@@ -37,15 +64,32 @@ def init_attn_backend(
     for kv_cache_group_id, kv_cache_group_spec in enumerate(
         kv_cache_config.kv_cache_groups
     ):
-        layer_names = kv_cache_group_spec.layer_names
-
         layer_type = cast(type[Any], AttentionLayerBase)
-        attn_layers = get_layers_from_vllm_config(vllm_config, layer_type, layer_names)
+        attn_layers, missing_layer_names = resolve_layers_from_vllm_config(
+            vllm_config, layer_type, kv_cache_group_spec.layer_names
+        )
+        if missing_layer_names:
+            logger.debug(
+                "Skipping %d remote layer(s) for KV cache group on this rank: %s",
+                len(missing_layer_names),
+                ", ".join(missing_layer_names[:3])
+                + ("..." if len(missing_layer_names) > 3 else ""),
+            )
+
+        local_layer_names = [
+            name for name in kv_cache_group_spec.layer_names
+            if name in attn_layers
+        ]
+        _prune_kv_cache_group_layers(kv_cache_group_spec, local_layer_names)
+
+        if not local_layer_names:
+            attn_groups.append([])
+            continue
 
         group_map: dict[tuple[tuple[str, str], KVCacheSpec], AttentionGroup] = {}
         group_order: list[tuple[tuple[str, str], KVCacheSpec]] = []
 
-        for layer_name in layer_names:
+        for layer_name in local_layer_names:
             attn_backend = attn_layers[layer_name].get_attn_backend()
             attn_backends[layer_name] = attn_backend
 
@@ -86,16 +130,18 @@ def init_attn_backend(
 
 def _allocate_kv_cache(kv_cache_config: KVCacheConfig, device: torch.device):
     kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
+    active_layer_names = {
+        layer_name
+        for group in kv_cache_config.kv_cache_groups
+        for layer_name in group.layer_names
+    }
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
         tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
         for layer_name in kv_cache_tensor.shared_by:
-            kv_cache_raw_tensors[layer_name] = tensor
+            if layer_name in active_layer_names:
+                kv_cache_raw_tensors[layer_name] = tensor
 
-    layer_names = set()
-    for group in kv_cache_config.kv_cache_groups:
-        for layer_name in group.layer_names:
-            layer_names.add(layer_name)
-    assert layer_names == set(kv_cache_raw_tensors.keys()), (
+    assert active_layer_names == set(kv_cache_raw_tensors.keys()), (
         "Some layers are not correctly initialized"
     )
     return kv_cache_raw_tensors
