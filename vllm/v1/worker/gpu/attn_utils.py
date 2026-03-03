@@ -5,7 +5,12 @@ from typing import Any, cast
 
 import torch
 
-from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.config import (
+    VllmConfig,
+    get_layers_from_vllm_config,
+    resolve_layers_from_vllm_config,
+)
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import (
     AttentionBackend,
@@ -15,9 +20,22 @@ from vllm.v1.attention.backend import (
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
+    KVCacheGroupSpec,
     KVCacheSpec,
 )
 from vllm.v1.worker.utils import bind_kv_cache
+
+logger = init_logger(__name__)
+
+
+def _prune_kv_cache_group_layers(
+    kv_cache_group_spec: KVCacheGroupSpec,
+    local_layer_names: list[str],
+) -> None:
+    """Prune a KV cache group to only contain layers present on this rank."""
+    if len(local_layer_names) == len(kv_cache_group_spec.layer_names):
+        return
+    kv_cache_group_spec.layer_names = local_layer_names
 
 
 def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
@@ -35,22 +53,39 @@ def init_attn_backend(
     kv_cache_config: KVCacheConfig, vllm_config: VllmConfig, device: torch.device
 ):
     attn_backends: dict[str, type[AttentionBackend]] = {}
-    attn_metadata_builders: list[AttentionMetadataBuilder] = []
+    attn_metadata_builders: list[AttentionMetadataBuilder | None] = []
     flashinfer_workspace: torch.Tensor | None = None
     for kv_cache_group_spec in kv_cache_config.kv_cache_groups:
-        layer_names = kv_cache_group_spec.layer_names
-        any_layer_name = next(iter(layer_names))
-
         layer_type = cast(type[Any], AttentionLayerBase)
-        attn_layers = get_layers_from_vllm_config(vllm_config, layer_type, layer_names)
-        attn_backend = attn_layers[any_layer_name].get_attn_backend()
-        for layer_name in layer_names:
-            attn_backends[layer_name] = attn_backend
+        attn_layers, missing_layer_names = resolve_layers_from_vllm_config(
+            vllm_config, layer_type, kv_cache_group_spec.layer_names
+        )
+        if missing_layer_names:
+            logger.debug(
+                "Skipping %d remote layer(s) for KV cache group on this rank: %s",
+                len(missing_layer_names),
+                ", ".join(missing_layer_names[:3])
+                + ("..." if len(missing_layer_names) > 3 else ""),
+            )
+
+        local_layer_names = [
+            name for name in kv_cache_group_spec.layer_names
+            if name in attn_layers
+        ]
+        _prune_kv_cache_group_layers(kv_cache_group_spec, local_layer_names)
+
+        if not local_layer_names:
+            attn_metadata_builders.append(None)
+            continue
+
+        attn_backend = attn_layers[local_layer_names[0]].get_attn_backend()
+        for layer_name in local_layer_names:
+            attn_backends[layer_name] = attn_layers[layer_name].get_attn_backend()
 
         attn_metadata_builder = attn_backend.get_builder_cls()(
-            kv_cache_group_spec.kv_cache_spec, layer_names, vllm_config, device
+            kv_cache_group_spec.kv_cache_spec, local_layer_names, vllm_config, device
         )
-        attn_metadata_builders.append(attn_metadata_builder)  # type: ignore
+        attn_metadata_builders.append(attn_metadata_builder)
 
         if attn_backend.get_name() == "FLASHINFER":
             if flashinfer_workspace is None:
@@ -62,16 +97,18 @@ def init_attn_backend(
 
 def _allocate_kv_cache(kv_cache_config: KVCacheConfig, device: torch.device):
     kv_cache_raw_tensors: dict[str, torch.Tensor] = {}
+    active_layer_names = {
+        layer_name
+        for group in kv_cache_config.kv_cache_groups
+        for layer_name in group.layer_names
+    }
     for kv_cache_tensor in kv_cache_config.kv_cache_tensors:
         tensor = torch.zeros(kv_cache_tensor.size, dtype=torch.int8, device=device)
         for layer_name in kv_cache_tensor.shared_by:
-            kv_cache_raw_tensors[layer_name] = tensor
+            if layer_name in active_layer_names:
+                kv_cache_raw_tensors[layer_name] = tensor
 
-    layer_names = set()
-    for group in kv_cache_config.kv_cache_groups:
-        for layer_name in group.layer_names:
-            layer_names.add(layer_name)
-    assert layer_names == set(kv_cache_raw_tensors.keys()), (
+    assert active_layer_names == set(kv_cache_raw_tensors.keys()), (
         "Some layers are not correctly initialized"
     )
     return kv_cache_raw_tensors
@@ -144,7 +181,7 @@ def build_slot_mappings_by_layer(
 
 
 def build_attn_metadata(
-    attn_metadata_builders: list[AttentionMetadataBuilder],
+    attn_metadata_builders: list[AttentionMetadataBuilder | None],
     num_reqs: int,
     num_tokens: int,
     query_start_loc_gpu: torch.Tensor,
@@ -161,6 +198,10 @@ def build_attn_metadata(
     attn_metadata: dict[str, Any] = {}
     kv_cache_groups = kv_cache_config.kv_cache_groups
     for i, kv_cache_spec in enumerate(kv_cache_groups):
+        attn_metadata_builder = attn_metadata_builders[i]
+        if attn_metadata_builder is None or not kv_cache_spec.layer_names:
+            continue
+
         block_table = block_tables[i]
         slot_mapping = slot_mappings[i]
 
@@ -177,7 +218,6 @@ def build_attn_metadata(
             causal=True,
         )
 
-        attn_metadata_builder = attn_metadata_builders[i]
         metadata = attn_metadata_builder.build(
             common_prefix_len=0, common_attn_metadata=common_attn_metadata
         )

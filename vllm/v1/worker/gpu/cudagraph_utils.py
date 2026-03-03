@@ -71,7 +71,7 @@ class CudaGraphManager:
         mrope_positions: torch.Tensor | None,
         inputs_embeds: torch.Tensor | None,
         block_tables: BlockTables,
-        attn_metadata_builders: list[AttentionMetadataBuilder],
+        attn_metadata_builders: list[AttentionMetadataBuilder | None],
         kv_cache_config: KVCacheConfig,
     ) -> None:
         num_reqs = min(num_tokens, self.max_num_reqs)
@@ -140,7 +140,7 @@ class CudaGraphManager:
         mrope_positions: torch.Tensor | None,
         inputs_embeds: torch.Tensor | None,
         block_tables: BlockTables,
-        attn_metadata_builders: list[AttentionMetadataBuilder],
+        attn_metadata_builders: list[AttentionMetadataBuilder | None],
         kv_cache_config: KVCacheConfig,
     ) -> None:
         capture_graphs(
@@ -237,7 +237,7 @@ def prepare_inputs_to_capture(
     num_tokens: int,
     input_buffers: InputBuffers,
     block_tables: BlockTables,
-    attn_metadata_builders: list[AttentionMetadataBuilder],
+    attn_metadata_builders: list[AttentionMetadataBuilder | None],
     max_model_len: int,
     kv_cache_config: KVCacheConfig,
 ) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:

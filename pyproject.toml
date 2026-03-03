@@ -5,8 +5,8 @@ requires = [
     "ninja",
     "packaging>=24.2",
     "setuptools>=77.0.3,<81.0.0",
-    "setuptools-scm>=8.0",
-    "torch == 2.9.1",
+    # "setuptools-scm>=8.0",  # disabled: version hardcoded for PP/TP patch
+    "torch >= 2.9.1",
     "wheel",
     "jinja2",
     "grpcio-tools==1.78.0",
@@ -32,7 +32,8 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Information Analysis",
 ]
 requires-python = ">=3.10,<3.14"
-dynamic = [ "version", "dependencies", "optional-dependencies"]
+version = "0.16.0"
+dynamic = [ "dependencies", "optional-dependencies"]
 
 [project.urls]
 Homepage="https://github.com/vllm-project/vllm"
@@ -46,8 +47,8 @@ vllm = "vllm.entrypoints.cli.main:main"
 lora_filesystem_resolver = "vllm.plugins.lora_resolvers.filesystem_resolver:register_filesystem_resolver"
 lora_hf_hub_resolver = "vllm.plugins.lora_resolvers.hf_hub_resolver:register_hf_hub_resolver"
 
-[tool.setuptools_scm]
-# no extra settings needed, presence enables setuptools-scm
+# [tool.setuptools_scm]
+# disabled: version hardcoded for PP/TP patch
 
 [tool.setuptools.packages.find]
 where = ["."]
