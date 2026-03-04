@@ -1096,42 +1096,48 @@ def get_moe_configs(
 def _ensure_block_size_k_divisible(
     size_k: int, block_size_k: int, group_size: int
 ) -> int:
-    """Ensure block_size_k is a divisor of size_k and divisible by group_size.
+    """Ensure block_size_k is compatible with the MoeWNA16 CUDA kernel.
 
-    This ensures BLOCK_SIZE_K compatibility with MoeWNA16 CUDA kernel which
-    requires size_k % BLOCK_SIZE_K == 0 and BLOCK_SIZE_K % group_size == 0.
+    The CUDA kernel requires ALL of:
+      1. size_k % BLOCK_SIZE_K == 0
+      2. BLOCK_SIZE_K % group_size == 0
+      3. BLOCK_SIZE_K // group_size in {1, 2, 4, 8}
 
     Args:
-        size_k: The size_k dimension that must be divisible by result.
+        size_k: The K dimension that must be divisible by the result.
         block_size_k: Preferred block size (will be adjusted if needed).
-        group_size: The result must be divisible by this.
+        group_size: Quantization group size.
 
     Returns:
-        A valid BLOCK_SIZE_K that divides size_k and is divisible by group_size.
+        A valid BLOCK_SIZE_K satisfying all three constraints.
     """
+    _VALID_RATIOS = {1, 2, 4, 8}
+
+    def _is_valid(candidate: int) -> bool:
+        return (
+            size_k % candidate == 0
+            and candidate % group_size == 0
+            and candidate // group_size in _VALID_RATIOS
+        )
+
+    # Clamp to the maximum ratio the kernel supports.
+    max_block = group_size * 8
+    block_size_k = min(block_size_k, max_block)
+
     # Fast path: already valid
-    if size_k % block_size_k == 0 and block_size_k % group_size == 0:
+    if _is_valid(block_size_k):
         return block_size_k
 
-    # Find the largest value that:
-    # 1. Divides size_k (size_k % candidate == 0)
-    # 2. Is divisible by group_size (candidate % group_size == 0)
-    # 3. Is <= block_size_k (prefer smaller values close to block_size_k)
-    #
-    # Strategy: Search from min(block_size_k, size_k) down to group_size,
-    # stepping by group_size to ensure divisibility by group_size
-    max_search = min(block_size_k, size_k)
-    start = (max_search // group_size) * group_size
-    for candidate in range(start, group_size - 1, -group_size):
-        if size_k % candidate == 0:
+    # Search downward from clamped value in group_size steps.
+    for candidate in range(block_size_k, group_size - 1, -group_size):
+        if _is_valid(candidate):
             return candidate
 
-    # Fallback: if group_size divides size_k, use it
-    # This should always be true with correct group_size configuration
-    if size_k % group_size == 0:
+    # Fallback: group_size itself (ratio = 1).
+    if _is_valid(group_size):
         return group_size
 
-    # This should not happen with correct group_size, but ensure divisibility
+    # Should not happen with correct group_size, but ensure divisibility.
     return size_k
 
 
