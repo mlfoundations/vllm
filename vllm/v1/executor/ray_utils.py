@@ -175,13 +175,18 @@ def assert_ray_available():
 
 
 def _verify_bundles(
-    placement_group: "PlacementGroup", parallel_config: ParallelConfig, device_str: str
+    placement_group: "PlacementGroup",
+    parallel_config: ParallelConfig,
+    device_str: str,
+    skip_driver_check: bool = False,
 ):
     """Verify a given placement group has bundles located in the right place.
 
     There are 2 rules.
     - Warn if all tensor parallel workers cannot fit in a single node.
-    - Fail if driver node is not included in a placement group.
+    - Fail if driver node is not included in a placement group
+      (skipped when *skip_driver_check* is True, e.g. for DP ranks > 0
+      whose per-rank PG may not include the head node).
     """
     assert ray.is_initialized(), (
         "Ray is not initialized although distributed-executor-backend is ray."
@@ -196,17 +201,19 @@ def _verify_bundles(
 
     for bundle_idx, node_id in bundle_to_node_ids.items():
         node_id_to_bundle[node_id].append(bundles[bundle_idx])
-    driver_node_id = ray.get_runtime_context().get_node_id()
 
-    if driver_node_id not in node_id_to_bundle:
-        raise RuntimeError(
-            f"driver node id {driver_node_id} is not included in a placement "
-            f"group {placement_group.id}. Node id -> bundles "
-            f"{node_id_to_bundle}. "
-            "You don't have enough GPUs available in a current node. Check "
-            "`ray status` and `ray list nodes` to see if you have available "
-            "GPUs in a node `{driver_node_id}` before starting an vLLM engine."
-        )
+    if not skip_driver_check:
+        driver_node_id = ray.get_runtime_context().get_node_id()
+        if driver_node_id not in node_id_to_bundle:
+            raise RuntimeError(
+                f"driver node id {driver_node_id} is not included in a "
+                f"placement group {placement_group.id}. Node id -> bundles "
+                f"{node_id_to_bundle}. "
+                "You don't have enough GPUs available in a current node. "
+                "Check `ray status` and `ray list nodes` to see if you have "
+                "available GPUs in a node `{driver_node_id}` before starting "
+                "an vLLM engine."
+            )
 
     for node_id, bundles in node_id_to_bundle.items():
         if len(bundles) < parallel_config.tensor_parallel_size:
@@ -311,17 +318,26 @@ def _wait_until_pg_removed(current_placement_group: "PlacementGroup"):
 
 
 def _get_or_create_dp_pg(
-    total_devices: int,
     device_str: str,
     dp_rank: int,
+    dp_size: int,
+    world_size: int,
     max_wait_sec: int = 120,
 ) -> "PlacementGroup":
-    """Create or retrieve a shared placement group for multi-DP Ray.
+    """Create or retrieve a per-DP-rank placement group for multi-DP Ray.
 
-    DP rank 0 creates the PG and writes it (pickled) to a temp file.
-    Other ranks poll the file until it appears, then unpickle the
-    handle.  This avoids Ray named-PG visibility issues across forked
-    processes.
+    Each DP rank gets its **own** placement group with exactly
+    ``world_size`` GPU bundles.  DP rank 0 creates *all* PGs
+    sequentially (so each one claims exclusive GPU resources from Ray
+    before the next is requested), then writes the list of handles to a
+    temp file.  Other ranks poll the file and pick their own PG.
+
+    This prevents the node-interleaving bug that occurred with a single
+    shared flat PG: with one PG of ``dp_size * world_size`` 1-GPU
+    bundles and ``strategy="PACK"``, Ray does not guarantee that
+    contiguous bundle-index ranges land on contiguous node sets, so
+    different DP ranks could end up with workers on the same node,
+    causing NCCL collisions during ``ncclCommInitRank``.
     """
     import pickle
     import tempfile
@@ -330,34 +346,43 @@ def _get_or_create_dp_pg(
 
     if dp_rank == 0:
         current_ip = get_ip()
-        specs: list[dict[str, float]] = [
-            {device_str: 1.0} for _ in range(total_devices)
-        ]
-        specs[0][f"node:{current_ip}"] = 0.001
-        pg = ray.util.placement_group(specs, strategy="PACK")
-        logger.info(
-            "DP rank 0: created shared placement group with %d %ss",
-            total_devices, device_str,
-        )
-        _wait_until_pg_ready(pg)
+        all_pgs: list["PlacementGroup"] = []
+        for rank_i in range(dp_size):
+            specs: list[dict[str, float]] = [
+                {device_str: 1.0} for _ in range(world_size)
+            ]
+            # Pin rank 0's first bundle to the head node so the driver
+            # worker (if used) can be co-located with the engine.
+            if rank_i == 0:
+                specs[0][f"node:{current_ip}"] = 0.001
+            pg = ray.util.placement_group(specs, strategy="PACK")
+            _wait_until_pg_ready(pg)
+            all_pgs.append(pg)
+            logger.info(
+                "DP rank 0: created placement group for DP rank %d "
+                "with %d %ss",
+                rank_i, world_size, device_str,
+            )
 
-        # Write the PG handle for other DP ranks.
+        # Write all PG handles for other DP ranks.
         tmp = sync_file + ".tmp"
         with open(tmp, "wb") as f:
-            pickle.dump(pg, f)
+            pickle.dump(all_pgs, f)
         os.replace(tmp, sync_file)  # atomic rename
-        logger.info("DP rank 0: wrote PG handle to %s", sync_file)
-        return pg
+        logger.info("DP rank 0: wrote %d PG handles to %s",
+                     dp_size, sync_file)
+        return all_pgs[0]
 
-    # DP rank > 0: wait for rank 0 to write the PG handle.
+    # DP rank > 0: wait for rank 0 to write the PG handles.
     start = time.time()
     while time.time() - start < max_wait_sec:
         if os.path.exists(sync_file):
             try:
                 with open(sync_file, "rb") as f:
-                    pg = pickle.load(f)
+                    all_pgs = pickle.load(f)
+                pg = all_pgs[dp_rank]
                 logger.info(
-                    "DP rank %d: loaded shared PG from %s", dp_rank, sync_file,
+                    "DP rank %d: loaded own PG from %s", dp_rank, sync_file,
                 )
                 _wait_until_pg_ready(pg)
                 return pg
@@ -431,6 +456,9 @@ def initialize_ray_cluster(
             f"current platform {current_platform.device_name} does not support ray."
         )
 
+    dp_size = parallel_config.data_parallel_size
+    dp_rank = parallel_config.data_parallel_rank
+
     # Create or get the placement group for worker processes
     if parallel_config.placement_group:
         current_placement_group = parallel_config.placement_group
@@ -463,14 +491,10 @@ def initialize_ray_cluster(
         logger.info("No current placement group found. Creating a new placement group.")
         num_devices_in_cluster = ray.cluster_resources().get(device_str, 0)
 
-        dp_size = parallel_config.data_parallel_size
-        dp_rank = parallel_config.data_parallel_rank
-
         if dp_size > 1:
-            # For multi-DP with Ray, create a single shared placement group
-            # for ALL DP ranks so they don't race for GPU resources.  Use a
-            # named PG so the second EngineCore to arrive reuses the PG
-            # created by the first.
+            # Each DP rank gets its own placement group so that Ray PACK
+            # keeps each TP group on a contiguous set of nodes.  Rank 0
+            # creates all PGs sequentially to prevent resource races.
             total_devices = parallel_config.world_size * dp_size
             if total_devices > num_devices_in_cluster:
                 logger.warning(
@@ -480,7 +504,10 @@ def initialize_ray_cluster(
                 )
 
             current_placement_group = _get_or_create_dp_pg(
-                total_devices, device_str, dp_rank,
+                device_str=device_str,
+                dp_rank=dp_rank,
+                dp_size=dp_size,
+                world_size=parallel_config.world_size,
             )
         else:
             # Original single-DP-rank logic.
@@ -520,7 +547,14 @@ def initialize_ray_cluster(
             _wait_until_pg_ready(current_placement_group)
 
     assert current_placement_group is not None
-    _verify_bundles(current_placement_group, parallel_config, device_str)
+    # For multi-DP with per-rank PGs, DP ranks > 0 may not have the
+    # head node in their PG — skip the driver-node check for them.
+    _verify_bundles(
+        current_placement_group,
+        parallel_config,
+        device_str,
+        skip_driver_check=(dp_size > 1 and dp_rank > 0),
+    )
     # Set the placement group in the parallel config
     parallel_config.placement_group = current_placement_group
 

@@ -200,16 +200,12 @@ class RayDistributedExecutor(Executor):
             )
         else:
             # use the first N bundles that have GPU resources.
+            # With per-DP-rank placement groups, each DP rank has its
+            # own PG with exactly world_size bundles — no offset needed.
             bundle_indices = []
             for bundle_id, bundle in enumerate(placement_group.bundle_specs):
                 if bundle.get(current_platform.ray_device_key, 0):
                     bundle_indices.append(bundle_id)
-            # For multi-DP with a shared placement group, each DP rank
-            # selects its own non-overlapping slice of bundles.
-            dp_rank = self.parallel_config.data_parallel_rank
-            ws = self.parallel_config.world_size
-            offset = dp_rank * ws
-            bundle_indices = bundle_indices[offset:offset + ws]
 
         worker_metadata: list[RayWorkerMetaData] = []
         driver_ip = get_ip()
