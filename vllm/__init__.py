@@ -105,3 +105,57 @@ __all__ = [
     "initialize_ray_cluster",
     "PoolingParams",
 ]
+
+# FP8 per-tensor no-transpose patch for weight sync compatibility
+import os as _os
+if _os.environ.get("SKYRL_FUSE_WEIGHTS") == "1":
+    try:
+        from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod as _Fp8LM
+        _orig_process = _Fp8LM.process_weights_after_loading
+
+        def _patched_process(self, layer, *args, **kwargs):
+            # Save param attributes before FP8 processing
+            _saved = {}
+            for _pn, _p in layer.named_parameters():
+                _a = {'subclass_type': type(_p)}
+                for _attr in ('weight_loader', 'output_dim', 'input_dim',
+                              '_output_dim', '_input_dim', 'packed_dim',
+                              'packed_factor', 'tp_rank', 'tp_size'):
+                    if hasattr(_p, _attr):
+                        _a[_attr] = getattr(_p, _attr)
+                _saved[_pn] = _a
+
+            # Run original (quantize + transpose)
+            _result = _orig_process(self, layer, *args, **kwargs)
+
+            # Un-transpose the weight back to [out, in] for weight sync compat
+            # The apply() method will transpose on-the-fly
+            if hasattr(layer, 'weight') and layer.weight.data.dim() == 2:
+                import torch
+                layer.weight = torch.nn.Parameter(
+                    layer.weight.data.t().contiguous(), requires_grad=False)
+
+            # Restore attributes
+            for _pn, _p in layer.named_parameters():
+                if _pn in _saved:
+                    for _attr, _val in _saved[_pn].items():
+                        try:
+                            setattr(_p, _attr, _val)
+                        except Exception:
+                            pass
+            return _result
+
+        _Fp8LM.process_weights_after_loading = _patched_process
+    except Exception as _e:
+        import warnings as _w
+        _w.warn(f"FP8 no-transpose patch failed: {_e}")
+
+# FlashRL FP8 patch - auto-activate when FLASHRL_CONFIG is set
+if _os.environ.get("FLASHRL_CONFIG"):
+    try:
+        from vllm.model_executor.layers.patch import apply_patch as _apply_flashrl
+        _apply_flashrl()
+    except Exception as _e:
+        import warnings as _w
+        _w.warn(f"FlashRL patch failed: {_e}")
+

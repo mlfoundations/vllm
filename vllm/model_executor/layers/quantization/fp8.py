@@ -635,9 +635,14 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
+        import os as _os
+        _weight = layer.weight
+        if _os.environ.get("SKYRL_FUSE_WEIGHTS") == "1" and _weight.dim() == 2:
+            # Weight stored as [out, in] for sync compat — transpose view for compute
+            _weight = _weight.t()
         return self.fp8_linear.apply(
             input=x,
-            weight=layer.weight,
+            weight=_weight,
             weight_scale=layer.weight_scale,
             out_dtype=self.out_dtype,
             input_scale=layer.input_scale,
