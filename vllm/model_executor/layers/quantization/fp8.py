@@ -519,6 +519,13 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
+        import os as _os
+        if _os.environ.get("SKYRL_FUSE_WEIGHTS") == "1" and hasattr(layer, 'weight') and layer.weight.dim() == 2:
+            # FP8 weight sync: weight stored as [out, in] — transpose view for compute
+            layer.weight.data = layer.weight.data.t().contiguous()
+            result = self.fp8_linear.apply_weights(layer, x, bias)
+            layer.weight.data = layer.weight.data.t().contiguous()
+            return result
         return self.fp8_linear.apply_weights(layer, x, bias)
 
 
@@ -600,6 +607,7 @@ class Fp8OnlineLinearMethod(Fp8LinearMethod):
             input_dim=1,
             output_dim=0,
             weight_loader=patched_weight_loader,
+
         )
         # stash the correct device for `patched_weight_loader`
         layer._load_device = torch.get_default_device()
