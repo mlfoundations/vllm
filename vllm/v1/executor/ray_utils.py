@@ -69,12 +69,19 @@ try:
 
         def adjust_rank(self, rank_mapping: dict[int, int]) -> None:
             """
-            Adjust the rpc_rank based on the given mapping.
+            Adjust the rpc_rank and global_rank based on the given mapping.
             It is only used during the initialization of the executor,
-            to adjust the rpc_rank of workers after we create all workers.
+            to adjust the ranks of workers after we create all workers.
+
+            Ray may reorder workers after creation; this method updates both
+            rpc_rank and global_rank so that
+            WorkerWrapperBase.initialize_from_config can index correctly into
+            kv_cache_configs[self.global_rank].
             """
             if self.rpc_rank in rank_mapping:
-                self.rpc_rank = rank_mapping[self.rpc_rank]
+                new_rank = rank_mapping[self.rpc_rank]
+                self.rpc_rank = new_rank
+                self.global_rank = new_rank
 
         def execute_method(self, method: str | bytes, *args, **kwargs):
             try:
