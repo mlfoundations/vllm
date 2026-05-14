@@ -2059,12 +2059,38 @@ class EngineCoreActorMixin:
         from vllm.platforms import current_platform
 
         if current_platform.is_xpu():
-            pass
-        else:
-            device_control_env_var = current_platform.device_control_env_var
+            return
+
+        device_control_env_var = current_platform.device_control_env_var
+        device_key = current_platform.ray_device_key
+        if not device_key:
+            # Platform with no Ray accelerator-key concept; defer to legacy.
             self._set_cuda_visible_devices(
                 vllm_config, local_dp_rank, device_control_env_var
             )
+            return
+
+        # EngineCoreActorMixin only runs inside a Ray actor. Use Ray's
+        # per-actor GPU assignment so cross-node DP works regardless of how
+        # CUDA_VISIBLE_DEVICES is pre-populated on the host (SLURM / launcher
+        # / Ray itself). The legacy `get_device_indices` formula assumes one
+        # node-wide CUDA_VISIBLE_DEVICES covers the full DP fleet and breaks
+        # with multi-node DP, where each node only exposes its local GPUs
+        # as "0,1,2,3" but local_dp_rank can be >= 1 (→ IndexError on [4,8)).
+        import ray
+
+        gpu_ids = ray.get_runtime_context().get_accelerator_ids()[device_key]
+        if not gpu_ids:
+            raise RuntimeError(
+                f"Ray returned no {device_key} ids for this actor "
+                f"(local_dp_rank={local_dp_rank}). The placement-group "
+                f"bundle is expected to bind GPUs to the actor; check "
+                f"that RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES is not "
+                f"set on this path."
+            )
+        os.environ[device_control_env_var] = ",".join(
+            str(int(x)) for x in gpu_ids
+        )
 
     def _set_cuda_visible_devices(
         self, vllm_config: VllmConfig, local_dp_rank: int, device_control_env_var: str

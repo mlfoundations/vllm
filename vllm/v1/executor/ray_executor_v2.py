@@ -508,12 +508,22 @@ class RayExecutorV2(MultiprocExecutor):
 
         self._join_monitor_thread()
 
-        for handle in getattr(self, "ray_worker_handles", []):
-            try:
-                ray.kill(handle.actor)
-                logger.debug("Killed actor rank=%d", handle.rank)
-            except Exception:
-                logger.exception("Failed to kill actor rank=%d", handle.rank)
+        # If Ray has already been torn down (e.g. its own atexit handler
+        # fired during interpreter shutdown after a failed _init_executor),
+        # don't call ray.kill — that would trigger Ray's auto_init_hook →
+        # ray.init(), creating a new session with a fresh job id, and our
+        # cached ActorHandles would all dereference as stale
+        # (ActorHandleNotFoundError). The actors get reaped when their
+        # raylets exit with the cluster.
+        if ray is None or not ray.is_initialized():
+            logger.debug("Ray already shut down — skipping per-actor cleanup.")
+        else:
+            for handle in getattr(self, "ray_worker_handles", []):
+                try:
+                    ray.kill(handle.actor)
+                    logger.debug("Killed actor rank=%d", handle.rank)
+                except Exception:
+                    logger.exception("Failed to kill actor rank=%d", handle.rank)
 
         if rpc_broadcast_mq := getattr(self, "rpc_broadcast_mq", None):
             rpc_broadcast_mq.shutdown()
