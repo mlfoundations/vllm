@@ -758,3 +758,58 @@ def _patch_cpp_indirect_assert_if_needed():
 
 
 _patch_cpp_indirect_assert_if_needed()
+
+
+# ===================================================
+# VLLM_FORCE_IPV4 — opt-in IPv4-only DNS resolution
+# ===================================================
+# Some HPC sites (JSC Jupiter, in particular) have compute-node hostnames
+# that resolve to BOTH IPv4 (A) and IPv6 (AAAA) DNS records, but the
+# IPv6 transport between compute nodes does not work
+# (`errno: 97 - Address family not supported by protocol`). torch.distributed's
+# c10d TCPStore and Gloo bootstrap iterate `socket.getaddrinfo()` results in
+# order; if the IPv6 entry comes first it tries an AF_INET6 socket and dies.
+# `GLOO_USE_IPV6=0` and `NCCL_SOCKET_FAMILY=AF_INET` cover NCCL/Gloo, but
+# c10d's pre-NCCL bootstrap consults getaddrinfo directly and is NOT gated
+# by those env vars.
+#
+# Setting `VLLM_FORCE_IPV4=1` wraps `socket.getaddrinfo` to filter out
+# AF_INET6 entries process-wide. This is opt-in and idempotent. Safe to
+# enable in any environment where IPv6 is broken or undesired.
+#
+# Observed failure mode this fixes (job 479619 on Jupiter, MiniMax-M2.7
+# data_parallel_size=2 with --data-parallel-backend mp):
+#   [c10d] The client socket cannot be initialized to connect to
+#   [jpbo-077-23.jupiter.internal]:36157
+#   (errno: 97 - Address family not supported by protocol)
+# → NCCL invalid usage → engine-core init crash → vLLM healthcheck timeout.
+
+
+def _apply_ipv4_only_getaddrinfo_patch():
+    """Filter AF_INET6 entries out of socket.getaddrinfo results."""
+    import socket
+
+    if getattr(socket, "_vllm_ipv4_only_patched", False):
+        return
+
+    _original_getaddrinfo = socket.getaddrinfo
+
+    def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        # Force AF_INET when the caller hasn't already constrained the
+        # family. If they explicitly asked for AF_INET6, we still honor
+        # it (caller knows what they want); only filter when family==0
+        # (the unconstrained default) or family==AF_UNSPEC.
+        if family in (0, socket.AF_UNSPEC):
+            family = socket.AF_INET
+        results = _original_getaddrinfo(host, port, family, type, proto, flags)
+        # Belt-and-suspenders: drop any AF_INET6 rows that may have
+        # slipped through (some libc implementations ignore family for
+        # numeric hosts).
+        return [r for r in results if r[0] != socket.AF_INET6]
+
+    socket.getaddrinfo = _patched_getaddrinfo
+    socket._vllm_ipv4_only_patched = True  # type: ignore[attr-defined]
+
+
+if os.environ.get("VLLM_FORCE_IPV4", "0").strip().lower() in ("1", "true"):
+    _apply_ipv4_only_getaddrinfo_patch()

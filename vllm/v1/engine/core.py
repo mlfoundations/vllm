@@ -2080,17 +2080,46 @@ class EngineCoreActorMixin:
         import ray
 
         gpu_ids = ray.get_runtime_context().get_accelerator_ids()[device_key]
-        if not gpu_ids:
-            raise RuntimeError(
-                f"Ray returned no {device_key} ids for this actor "
-                f"(local_dp_rank={local_dp_rank}). The placement-group "
-                f"bundle is expected to bind GPUs to the actor; check "
-                f"that RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES is not "
-                f"set on this path."
+        if gpu_ids:
+            os.environ[device_control_env_var] = ",".join(
+                str(int(x)) for x in gpu_ids
             )
-        os.environ[device_control_env_var] = ",".join(
-            str(int(x)) for x in gpu_ids
-        )
+            return
+
+        # Ray reported no accelerator binding for this actor. The
+        # EXPECTED case is DPMoEEngineCoreActor: vllm/v1/engine/utils.py
+        # places it on bundle index `world_size`, which is the CPU-only
+        # control bundle (_make_control_bundle returns {"CPU": 1, ...}).
+        # The MoE engine actor delegates GPU work to spawned RayWorkerProc
+        # actors on the preceding GPU bundles, so an empty
+        # accelerator_ids() here is not actually an error — fall back to
+        # the legacy formula that slices CUDA_VISIBLE_DEVICES by
+        # (local_dp_rank, world_size). For single-node DP that's
+        # exactly the right slice; for multi-node DP with local_dp_rank
+        # = 0 per node, it's [0:world_size] = the per-node GPU set.
+        #
+        # If that legacy slicing ALSO fails (typically IndexError when
+        # CUDA_VISIBLE_DEVICES is too narrow or missing), surface a loud
+        # combined diagnostic instead of letting the underlying error
+        # mask the fact that Ray's path was already empty.
+        try:
+            self._set_cuda_visible_devices(
+                vllm_config, local_dp_rank, device_control_env_var
+            )
+        except Exception as legacy_exc:
+            raise RuntimeError(
+                f"Failed to bind {device_key} ids for this actor "
+                f"(local_dp_rank={local_dp_rank}). Ray's "
+                f"get_runtime_context().get_accelerator_ids()[{device_key!r}] "
+                f"returned an empty list AND the legacy "
+                f"CUDA_VISIBLE_DEVICES slicing fallback also failed. "
+                f"Check that RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES "
+                f"is unset for the engine-core actor path and that "
+                f"CUDA_VISIBLE_DEVICES exposes enough devices for the "
+                f"range [{local_dp_rank * vllm_config.parallel_config.world_size}, "
+                f"{(local_dp_rank + 1) * vllm_config.parallel_config.world_size}). "
+                f"Legacy fallback error: {legacy_exc}"
+            ) from legacy_exc
 
     def _set_cuda_visible_devices(
         self, vllm_config: VllmConfig, local_dp_rank: int, device_control_env_var: str
