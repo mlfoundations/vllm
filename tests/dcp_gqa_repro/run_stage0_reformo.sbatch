@@ -1,16 +1,19 @@
 #!/bin/bash
 # SPDX-License-Identifier: Apache-2.0
-# Stage-0 DCP GQA LSE-combine repro harness — Jupiter reformo, 1 GPU, debug QOS.
+# Stage-0 DCP GQA LSE-combine repro harness — Jupiter reformo reservation, 1 GPU.
 # Runs the synthetic combine parity harness inside the 0.20.2rc0 SIF (torch 2.11
 # / vllm 0.20.2rc0). The Triton _correct_attn_cp_out_kernel needs a GPU.
+# reformo is a RESERVATION+ACCOUNT on the booster partition (IGNORE_JOBS), so a
+# 1-node/1-GPU smoke overlays free reservation capacity and does NOT displace RL.
 #
 #   sbatch -D /e/scratch/jureap59/feuer1/vllm tests/dcp_gqa_repro/run_stage0_reformo.sbatch
 #
 #SBATCH --job-name=dcp_stage0_repro
-#SBATCH --partition=reformo
-#SBATCH --qos=debug
+#SBATCH --partition=booster
+#SBATCH --account=reformo
+#SBATCH --reservation=reformo
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=1
+#SBATCH --gres=gpu:1
 #SBATCH --ntasks-per-node=1
 #SBATCH --time=00:20:00
 #SBATCH --output=dcp_stage0_repro_%j.out
