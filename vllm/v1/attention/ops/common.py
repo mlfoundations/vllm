@@ -1,9 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os as _os
+
 import torch
 
 from vllm.distributed.parallel_state import GroupCoordinator
 from vllm.triton_utils import tl, triton
+
+# Stage-1 DCP root-cause instrumentation (env-gated, default OFF). When
+# SKYRL_DCP_DEBUG=1, _cp_lse_common dumps the EXACT `lses` tensor handed to
+# correct_attn_out (shape/strides) + a pure-torch replication of the kernel's
+# per-cell rescale factor so we can read off whether the LSE stride walk lands
+# on the right (rank, B, H) cells. Inert unless the env var is set.
+_SKYRL_DCP_DEBUG = _os.environ.get("SKYRL_DCP_DEBUG", "0") == "1"
+_skyrl_common_calls = 0
 
 
 @triton.jit
@@ -199,6 +209,45 @@ def _cp_lse_common(
     lses = cp_group.all_gather(cp_attn_lse, dim=0).reshape(
         (cp_group.world_size,) + cp_attn_lse.shape
     )
+    global _skyrl_common_calls
+    if _SKYRL_DCP_DEBUG and _skyrl_common_calls < 8:
+        _skyrl_common_calls += 1
+        import logging
+
+        _lg = logging.getLogger("vllm.v1.attention.ops.common")
+        r = cp_group.rank_in_group
+        # Replicate the kernel's per-cell factor in pure torch using the SAME
+        # `lses` tensor (so any stride/orientation defect shows identically):
+        #   lse_global = logsumexp_n(lses[n,b,h]);  factor = exp(lses[r,b,h]-lse_g)
+        lf = lses.float()  # [N,B,H]
+        safe = torch.where(torch.isfinite(lf), lf, torch.full_like(lf, -1e30))
+        lse_g = torch.logsumexp(safe, dim=0)  # [B,H]
+        factor = torch.exp(safe[r] - lse_g)  # [B,H]
+        # Where the gathered cp_attn_lse rows actually came from: compare lses[r]
+        # against THIS rank's own cp_attn_lse (must be equal if reshape is right).
+        own = cp_attn_lse.float()
+        own_vs_slice = (lses[r].float() - own).abs().max().item()
+        _lg.info(
+            "[SKYRL_DCP_DEBUG] (common) rank=%d N=%d lses.shape=%s "
+            "lses.stride=%s cp_attn_lse.shape=%s | lses[r]==own? max|Δ|=%.3e | "
+            "factor(this rank) min=%.4f max=%.4f mean=%.4f | factor==1 frac=%.3f",
+            r,
+            cp_group.world_size,
+            tuple(lses.shape),
+            tuple(lses.stride()),
+            tuple(cp_attn_lse.shape),
+            own_vs_slice,
+            factor[torch.isfinite(factor)].min().item()
+            if torch.isfinite(factor).any()
+            else float("nan"),
+            factor[torch.isfinite(factor)].max().item()
+            if torch.isfinite(factor).any()
+            else float("nan"),
+            factor[torch.isfinite(factor)].mean().item()
+            if torch.isfinite(factor).any()
+            else float("nan"),
+            ((factor > 0.999).float().mean().item()),
+        )
     out, lse = correct_attn_out(
         cp_attn_out,
         lses,
