@@ -971,35 +971,57 @@ class FlashAttentionImpl(AttentionImpl):
         try:
             r = dcp_grp.rank_in_group
             w = dcp_grp.world_size
-            # Gather every rank's partial out [B,Hg,D] and lse [Hg,B].
-            out_all = dcp_grp.all_gather(context_attn_out.contiguous(), dim=0)
-            lse_all = dcp_grp.all_gather(context_lse.contiguous(), dim=0)
-            B, Hg, D = context_attn_out.shape
-            # all_gather(dim=0) stacks rank-major along dim 0.
-            out_all = out_all.reshape(w, B, Hg, D).float()  # [W,B,Hg,D]
-            lse_all = lse_all.reshape(w, Hg, B).float()  # [W,Hg,B]
-            # Online-softmax reduction across the W ranks (base-e).
-            lse_g = torch.logsumexp(lse_all, dim=0)  # [Hg,B] global LSE
-            wts = torch.exp(lse_all - lse_g.unsqueeze(0))  # [W,Hg,B]
-            # weight out[w,b,h,d] by wts[w,h,b]
-            wts_bhd = wts.permute(0, 2, 1).unsqueeze(-1)  # [W,B,Hg,1]
-            ref_out_full = (out_all * wts_bhd).sum(0)  # [B,Hg,D]
-            ref_lse_full = lse_g.transpose(0, 1)  # [B,Hg]
-            # This rank's own-head slice (matches the per-rank LSE slice
-            # cp_num_heads*rank in cp_lse_ag_out_rs).
+            B, Hg, D = context_attn_out.shape  # Hg = num_heads * dcp_world
             cp_h = Hg // w
+            # Gather every rank's partial out [B,Hg,D] and lse [Hg,B] and split
+            # back into the per-rank list (torch.chunk on the gathered dim is
+            # robust to whichever rank-major layout the collective produced).
+            out_all = dcp_grp.all_gather(context_attn_out.contiguous(), dim=0)
+            lse_all = dcp_grp.all_gather(
+                context_lse.transpose(0, 1).contiguous(), dim=0
+            )  # gather [B,Hg] -> [w*B, Hg]
+            out_list = [c.float() for c in torch.chunk(out_all, w, dim=0)]
+            lse_list = [c.float() for c in torch.chunk(lse_all, w, dim=0)]
+            out_stk = torch.stack(out_list, dim=0)  # [W,B,Hg,D]
+            lse_stk = torch.stack(lse_list, dim=0)  # [W,B,Hg]
+            # CORRECT cross-rank combine: per head-cell, global LSE over ranks,
+            # then sum_r out_r * exp(lse_r - lse_global). This is exactly what
+            # correct_attn_out (per-rank rescale) + reduce_scatter (sum over
+            # ranks, scatter heads) compute together — base-e.
+            lse_g = torch.logsumexp(lse_stk, dim=0)  # [B,Hg]
+            wts = torch.exp(lse_stk - lse_g.unsqueeze(0)).unsqueeze(-1)  # [W,B,Hg,1]
+            ref_out_full = (out_stk * wts).sum(0)  # [B,Hg,D]
+            # reduce_scatter keeps THIS rank's head block.
             ref_out = ref_out_full[:, r * cp_h : (r + 1) * cp_h, :]
-            ref_lse = ref_lse_full[:, r * cp_h : (r + 1) * cp_h]
-            d_out = (context_attn_out_cor.float() - ref_out).abs().max().item()
-            d_lse = (context_lse_cor.float() - ref_lse).abs().max().item()
+            ref_lse = lse_g[:, r * cp_h : (r + 1) * cp_h]  # [B,cp_h]
+            # context_lse_cor arrives as [B,cp_h] (already transposed back).
+            clc = context_lse_cor.float()
+            if clc.shape != ref_lse.shape and clc.transpose(0, 1).shape == ref_lse.shape:
+                clc = clc.transpose(0, 1)
+            # Compare only finite cells (zero-context ranks emit -inf LSE / 0 out).
+            fin = torch.isfinite(ref_out).all(dim=-1) & torch.isfinite(
+                context_attn_out_cor.float()
+            ).all(dim=-1)
+            if fin.any():
+                d_out = (
+                    (context_attn_out_cor.float()[fin] - ref_out[fin]).abs().max().item()
+                )
+            else:
+                d_out = float("nan")
+            finl = torch.isfinite(ref_lse) & torch.isfinite(clc)
+            d_lse = (clc[finl] - ref_lse[finl]).abs().max().item() if finl.any() else float("nan")
             logger.info(
                 "[SKYRL_DCP_DEBUG] rank%d (REF) kernel-vs-fp32-online-softmax "
-                "combine: max|Δout|=%.4e  max|Δlse|=%.4e  (small ⇒ combine math "
-                "correct on real inputs ⇒ look at (a) KV-shard or (e) merge; "
-                "large ⇒ combine input-construction / head-accounting wrong)",
+                "combine over finite cells: max|Δout|=%.4e max|Δlse|=%.4e "
+                "Hg=%d cp_h=%d B=%d (SMALL ⇒ combine math correct on real "
+                "inputs ⇒ locus is (a) KV-shard contents or (e) merge; LARGE "
+                "⇒ combine input-construction/head-accounting is the defect)",
                 r,
                 d_out,
                 d_lse,
+                Hg,
+                cp_h,
+                B,
             )
         except Exception as e:  # pragma: no cover - debug only
             logger.info("[SKYRL_DCP_DEBUG] (REF) check err %s", e)
