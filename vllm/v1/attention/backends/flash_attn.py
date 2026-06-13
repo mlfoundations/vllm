@@ -1415,6 +1415,35 @@ class FlashAttentionImpl(AttentionImpl):
                     if finf.any()
                     else float("nan")
                 )
+                # --- (C) CONTEXT-ONLY: does (F)'s reconstructed context term
+                # (online-softmax of the gathered RAW context partials) equal
+                # the kernel's corrected context (context_attn_out_cor)? If (C)~0
+                # then (F)'s context build is faithful (so a large (F) means the
+                # SELF term / decode self-attn is the defect); if (C) large then
+                # (F)'s head-indexing is itself off (false-positive guard vs the
+                # Stage-1 trap). Cross-checks against the trustworthy DEBUG2.
+                g_c = torch.logsumexp(ctx_lse, dim=0)  # [B,H] context-only global
+                wts_c = torch.exp(ctx_lse - g_c.unsqueeze(0)).unsqueeze(-1)
+                ref_ctx = (ctx_out * wts_c).sum(0)  # [B,H,D]
+                kc = context_attn_out_cor.float()
+                finc = torch.isfinite(ref_ctx).all(-1) & torch.isfinite(kc).all(-1)
+                d_ctx = (
+                    (ref_ctx[finc] - kc[finc]).abs().max().item()
+                    if finc.any()
+                    else float("nan")
+                )
+                # (S) SELF-only: kernel's query_attn_out vs a recompute is not
+                # available here, but compare the kernel's context LSE the merge
+                # used (context_lse_cor) against (F)'s context-only global LSE —
+                # a mismatch means the LSE handed to the merge disagrees with the
+                # true context LSE (the decode-growing weight defect).
+                clc = context_lse_cor.float().transpose(0, 1)  # [B,H]
+                finl = torch.isfinite(clc) & torch.isfinite(g_c)
+                d_clse = (
+                    (clc[finl] - g_c[finl]).abs().max().item()
+                    if finl.any()
+                    else float("nan")
+                )
                 # Per-token (decode-position) max|Δ| for the FULL ref, so the
                 # GROWTH with decode length is visible directly.
                 per_tok = (
@@ -1425,14 +1454,17 @@ class FlashAttentionImpl(AttentionImpl):
                 logger.info(
                     "[SKYRL_DCP_DEBUG3] rank%d call#%d n_tok=%d "
                     "(M)merge-only max|Δ|=%.4e  (F)full-from-raw max|Δ|=%.4e  "
-                    "per-tok|Δ|=%s  (M~0 & F~0 ⇒ merge+terms OK here; "
-                    "M~0 & F large ⇒ a context/self TERM is wrong; "
-                    "M large ⇒ merge math/inputs wrong)",
+                    "(C)ctx-recon-vs-kernel max|Δ|=%.4e  (Lc)ctxLSE-vs-true "
+                    "max|Δ|=%.4e  per-tok|Δ|=%s  (M~0 & F~0 ⇒ merge+terms OK; "
+                    "M~0 & F large & C~0 ⇒ SELF term/decode-self-attn defect; "
+                    "C large ⇒ (F) head-index artifact)",
                     r,
                     _skyrl_dcp_debug3_calls,
                     int(n),
                     d_merge,
                     d_full,
+                    d_ctx,
+                    d_clse,
                     ["%.3e" % x for x in per_tok[:8]],
                 )
             except Exception as _e3:  # pragma: no cover - debug only
