@@ -325,8 +325,35 @@ def cp_lse_ag_out_rs(
     out, lse = _cp_lse_common(
         cp_attn_out, cp_attn_lse, cp_group, ctx=ctx, is_lse_base_on_e=is_lse_base_on_e
     )
+    global _skyrl_common_calls
+    _dbg_rs = _SKYRL_DCP_DEBUG and _skyrl_common_calls <= 60
+    if _dbg_rs:
+        _out_pre_rs = out.detach().float().clone()  # [B,Hg,D] this rank's weighted out
     out = cp_group.reduce_scatter(out, dim=1)
+    if _dbg_rs:
+        import logging
 
+        _lg = logging.getLogger("vllm.v1.attention.ops.common")
+        r = cp_group.rank_in_group
+        w = cp_group.world_size
+        cp_h = _out_pre_rs.shape[1] // w
+        # FULL pre-rs weighted output across ALL Hg heads at b=0,d=0, plus the
+        # post-reduce_scatter value for this rank's own head 0. reduce_scatter
+        # output head h on rank r = sum_s in_s[r*cp_h + h]; so post[0] should be
+        # sum over ranks of in_s[r*cp_h]. We log each rank's full row so the two
+        # ranks' logs can be cross-summed by hand.
+        pre_row = [_out_pre_rs[0, h, 0].item() for h in range(_out_pre_rs.shape[1])]
+        post = out.detach().float()[0, 0, 0].item()  # after rs, this rank head 0
+        _lg.info(
+            "[SKYRL_DCP_DEBUG] (rs) rank=%d cp_h=%d pre-rs WEIGHTED out[0,:,0]=%s "
+            "| post-rs out[0,0,0]=%.6f (post[r] = sum_s pre_s[0, r*cp_h, 0]; "
+            "cross-ref the other rank's pre-rs row at index r*cp_h=%d)",
+            r,
+            cp_h,
+            ["%.5f" % x for x in pre_row],
+            post,
+            r * cp_h,
+        )
     if return_lse:
         cp_num_heads = lse.shape[1] // cp_group.world_size
         cp_rank = cp_group.rank_in_group
