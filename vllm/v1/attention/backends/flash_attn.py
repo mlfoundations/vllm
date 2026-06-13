@@ -65,6 +65,57 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 
 logger = init_logger(__name__)
 
+# ---------------------------------------------------------------------------
+# Stage-1 DCP-GQA root-cause instrumentation (env-gated, default OFF).
+#
+# Set SKYRL_DCP_DEBUG=1 to dump the construction-step tensors inside
+# `_forward_with_dcp` so the dcp=2 real path can be diffed against a dcp=1
+# reference. This is INERT (G1: no behavior change) unless the env var is set.
+# Keep it committed (gated off) so Stage 2/3 can reuse it. See
+# notes/vllm/stage1_root_cause_scope.md.
+#
+# Controls:
+#   SKYRL_DCP_DEBUG=1            enable dumps
+#   SKYRL_DCP_DEBUG_MAXCALLS=N   only dump the first N _forward_with_dcp calls
+#                                (per process; default 4) to avoid log flooding
+#   SKYRL_DCP_DEBUG_REF=1        also recompute, in fp32, a reference combine of
+#                                the all-gathered per-rank (out, lse) and diff it
+#                                against the kernel's context_attn_out_cor — this
+#                                isolates whether the context-combine itself is
+#                                wrong on the REAL (NCCL-gathered, real-FA-LSE)
+#                                inputs vs. the KV-shard contents / final merge.
+# ---------------------------------------------------------------------------
+import os as _os
+
+_SKYRL_DCP_DEBUG = _os.environ.get("SKYRL_DCP_DEBUG", "0") == "1"
+_SKYRL_DCP_DEBUG_REF = _os.environ.get("SKYRL_DCP_DEBUG_REF", "0") == "1"
+try:
+    _SKYRL_DCP_DEBUG_MAXCALLS = int(_os.environ.get("SKYRL_DCP_DEBUG_MAXCALLS", "4"))
+except ValueError:
+    _SKYRL_DCP_DEBUG_MAXCALLS = 4
+_skyrl_dcp_debug_calls = 0
+
+
+def _skyrl_t(name, t):
+    """One-line tensor summary for the Stage-1 DCP dump (None-safe)."""
+    if t is None:
+        return f"{name}=None"
+    try:
+        flat = t.detach().float().reshape(-1)
+        finite = flat[torch.isfinite(flat)]
+        stats = (
+            f"min={finite.min().item():.4e} max={finite.max().item():.4e} "
+            f"mean={finite.mean().item():.4e}"
+            if finite.numel() > 0
+            else "all-nonfinite"
+        )
+    except Exception as e:  # pragma: no cover - debug only
+        stats = f"<stat-error {e}>"
+    return (
+        f"{name}: shape={tuple(t.shape)} dtype={t.dtype} "
+        f"stride={tuple(t.stride())} contig={t.is_contiguous()} {stats}"
+    )
+
 
 class FlashAttentionBackend(AttentionBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
@@ -895,6 +946,64 @@ class FlashAttentionImpl(AttentionImpl):
             layer._v_scale,
         )
 
+    def _skyrl_dcp_ref_combine_check(
+        self,
+        context_attn_out: torch.Tensor,
+        context_lse: torch.Tensor,
+        context_attn_out_cor: torch.Tensor,
+        context_lse_cor: torch.Tensor,
+        dcp_grp,
+    ) -> None:
+        """Stage-1 reference combine check (SKYRL_DCP_DEBUG_REF=1).
+
+        Each DCP rank produced a partial ``(context_attn_out [B,Hg,D],
+        context_lse [Hg,B])`` over its OWN KV shard (Hg = num_heads*dcp_world).
+        The CORRECT cross-rank combine for the gathered query is an
+        online-softmax reduction over the per-rank partials. We all-gather every
+        rank's partials and recompute that reduction in fp32, then diff this
+        rank's own-head slice against the kernel's ``context_attn_out_cor`` /
+        ``context_lse_cor``. If the kernel matches this reference, the
+        context-combine math is correct on the REAL inputs (so the e2e drift is
+        in candidate (a) KV-shard contents or (e) the final merge); if it
+        diverges, the locus is the combine input-construction itself (candidate
+        1/d head accounting).
+        """
+        try:
+            r = dcp_grp.rank_in_group
+            w = dcp_grp.world_size
+            # Gather every rank's partial out [B,Hg,D] and lse [Hg,B].
+            out_all = dcp_grp.all_gather(context_attn_out.contiguous(), dim=0)
+            lse_all = dcp_grp.all_gather(context_lse.contiguous(), dim=0)
+            B, Hg, D = context_attn_out.shape
+            # all_gather(dim=0) stacks rank-major along dim 0.
+            out_all = out_all.reshape(w, B, Hg, D).float()  # [W,B,Hg,D]
+            lse_all = lse_all.reshape(w, Hg, B).float()  # [W,Hg,B]
+            # Online-softmax reduction across the W ranks (base-e).
+            lse_g = torch.logsumexp(lse_all, dim=0)  # [Hg,B] global LSE
+            wts = torch.exp(lse_all - lse_g.unsqueeze(0))  # [W,Hg,B]
+            # weight out[w,b,h,d] by wts[w,h,b]
+            wts_bhd = wts.permute(0, 2, 1).unsqueeze(-1)  # [W,B,Hg,1]
+            ref_out_full = (out_all * wts_bhd).sum(0)  # [B,Hg,D]
+            ref_lse_full = lse_g.transpose(0, 1)  # [B,Hg]
+            # This rank's own-head slice (matches the per-rank LSE slice
+            # cp_num_heads*rank in cp_lse_ag_out_rs).
+            cp_h = Hg // w
+            ref_out = ref_out_full[:, r * cp_h : (r + 1) * cp_h, :]
+            ref_lse = ref_lse_full[:, r * cp_h : (r + 1) * cp_h]
+            d_out = (context_attn_out_cor.float() - ref_out).abs().max().item()
+            d_lse = (context_lse_cor.float() - ref_lse).abs().max().item()
+            logger.info(
+                "[SKYRL_DCP_DEBUG] rank%d (REF) kernel-vs-fp32-online-softmax "
+                "combine: max|Δout|=%.4e  max|Δlse|=%.4e  (small ⇒ combine math "
+                "correct on real inputs ⇒ look at (a) KV-shard or (e) merge; "
+                "large ⇒ combine input-construction / head-accounting wrong)",
+                r,
+                d_out,
+                d_lse,
+            )
+        except Exception as e:  # pragma: no cover - debug only
+            logger.info("[SKYRL_DCP_DEBUG] (REF) check err %s", e)
+
     def _forward_with_dcp(
         self,
         query: torch.Tensor,
@@ -916,12 +1025,109 @@ class FlashAttentionImpl(AttentionImpl):
         max_seqlen_q = attn_metadata.max_query_len
         block_table = attn_metadata.block_table
 
+        global _skyrl_dcp_debug_calls
+        _dbg = _SKYRL_DCP_DEBUG and (
+            _skyrl_dcp_debug_calls < _SKYRL_DCP_DEBUG_MAXCALLS
+        )
+        _dcp_grp = get_dcp_group()
+        if _dbg:
+            _skyrl_dcp_debug_calls += 1
+            _r = _dcp_grp.rank_in_group
+            _w = _dcp_grp.world_size
+            logger.info(
+                "[SKYRL_DCP_DEBUG] === _forward_with_dcp call #%d | "
+                "dcp_rank=%d dcp_world=%d num_heads(per-tp)=%d num_kv_heads=%d "
+                "q_per_kv=%d head_size=%d scale=%s interleave=%s causal=%s "
+                "fa_version=%s kv_dtype=%s ===",
+                _skyrl_dcp_debug_calls,
+                _r,
+                _w,
+                self.num_heads,
+                self.num_kv_heads,
+                self.num_queries_per_kv,
+                self.head_size,
+                self.scale,
+                getattr(self, "cp_kv_cache_interleave_size", "?"),
+                attn_metadata.causal,
+                self.vllm_flash_attn_version,
+                self.kv_cache_dtype,
+            )
+            # Candidate (a): varlen KV sharding boundaries this rank reads.
+            logger.info(
+                "[SKYRL_DCP_DEBUG] rank%d (a) %s | max_dcp_context_kv_len=%s "
+                "max_seq_len=%s | %s | %s",
+                _r,
+                _skyrl_t("dcp_context_kv_lens", attn_metadata.dcp_context_kv_lens),
+                attn_metadata.max_dcp_context_kv_len,
+                attn_metadata.max_seq_len,
+                _skyrl_t("seq_lens", attn_metadata.seq_lens),
+                _skyrl_t("query_start_loc", attn_metadata.query_start_loc),
+            )
+            logger.info(
+                "[SKYRL_DCP_DEBUG] rank%d (a) %s | %s",
+                _r,
+                _skyrl_t("query(pre-gather)", query),
+                _skyrl_t("block_table", attn_metadata.block_table),
+            )
+            # Candidate (c): the descales actually fed to FA.
+            logger.info(
+                "[SKYRL_DCP_DEBUG] rank%d (c) %s | %s | %s",
+                _r,
+                _skyrl_t("q_descale", q_descale),
+                _skyrl_t("k_descale", k_descale),
+                _skyrl_t("v_descale", v_descale),
+            )
+
         query = query.contiguous()
-        query_across_dcp = get_dcp_group().all_gather(query, dim=1)
+        query_across_dcp = _dcp_grp.all_gather(query, dim=1)
         sliding_window_size = (
             list(self.sliding_window) if self.sliding_window is not None else None
         )
         n = query_across_dcp.shape[0]
+        if _dbg:
+            # Candidate (d): the real NCCL all_gather head ordering. The gathered
+            # query carries num_heads*dcp_world heads on dim=1. The FA kernel will
+            # derive its GQA grouping from (gathered_q_heads / kv_heads). Confirm
+            # whether rank r's OWN heads sit at [r*num_heads : (r+1)*num_heads]
+            # (rank-major replication, what the per-rank LSE slice assumes) AND
+            # what GQA group FA will assign each gathered head.
+            _Hg = query_across_dcp.shape[1]
+            _fa_qpkv = _Hg // self.num_kv_heads if self.num_kv_heads else -1
+            logger.info(
+                "[SKYRL_DCP_DEBUG] rank%d (d) %s | gathered_q_heads=%d "
+                "=> FA-effective q_per_kv=%d (kv_heads=%d). own-slice "
+                "[%d:%d]. per-head->FA-kv-group = head//%d ; per-head->true-kv "
+                "= (head%%%d)//%d",
+                _r,
+                _skyrl_t("query_across_dcp", query_across_dcp),
+                _Hg,
+                _fa_qpkv,
+                self.num_kv_heads,
+                _r * self.num_heads,
+                (_r + 1) * self.num_heads,
+                _fa_qpkv,
+                self.num_heads,
+                self.num_queries_per_kv,
+            )
+            # Per-rank head-identity probe: are the gathered heads literally
+            # rank-major REPLICAS of the same query (queries are NOT sharded
+            # across DCP, only KV is)? Compare rank r's own slice vs rank 0's.
+            try:
+                _own = query_across_dcp[
+                    :, _r * self.num_heads : (_r + 1) * self.num_heads, :
+                ]
+                _slice0 = query_across_dcp[:, 0 : self.num_heads, :]
+                _rep_dmax = (_own.float() - _slice0.float()).abs().max().item()
+                logger.info(
+                    "[SKYRL_DCP_DEBUG] rank%d (d) own-slice vs rank0-slice "
+                    "max|Δ|=%.4e (==0 ⇒ gathered heads are rank-major REPLICAS "
+                    "of identical query, so the dcp_world copies differ ONLY by "
+                    "which KV shard they attend — the combine assumption)",
+                    _r,
+                    _rep_dmax,
+                )
+            except Exception as e:  # pragma: no cover - debug only
+                logger.info("[SKYRL_DCP_DEBUG] rank%d (d) replica-probe err %s", _r, e)
         (dcp_context_out,) = current_workspace_manager().get_simultaneous(
             (
                 (n, self.num_heads * self.dcp_world_size, self.head_size),
@@ -951,14 +1157,48 @@ class FlashAttentionImpl(AttentionImpl):
             v_descale=v_descale,
             num_splits=attn_metadata.max_num_splits,
         )
+        if _dbg:
+            # Candidate (b): the LSE base FA actually emits. Standard FA emits
+            # natural-log (base-e) LSE; cp_lse_ag_out_rs defaults is_lse_base_on_e
+            # =True. FlashInfer's DCP path forces False (backend-specific!). Dump
+            # raw context_lse magnitude so a base-2 (=log2) vs base-e mismatch is
+            # visible (base-2 values are ~1.4427x the base-e values for the same
+            # softmax denominator).
+            logger.info(
+                "[SKYRL_DCP_DEBUG] rank%d (b/e) %s | %s",
+                _dcp_grp.rank_in_group,
+                _skyrl_t("context_attn_out(FA,[B,Hg,D])", context_attn_out),
+                _skyrl_t("context_lse(FA,[Hg,B])", context_lse),
+            )
         # FA returns LSE in shape [ H, B ] but DCP combine wants [ B, H ]
+        _context_lse_in = context_lse.transpose(0, 1)
+        if _dbg:
+            logger.info(
+                "[SKYRL_DCP_DEBUG] rank%d (1) %s -> dcp_combine",
+                _dcp_grp.rank_in_group,
+                _skyrl_t("context_lse.transpose(0,1)[B,Hg]", _context_lse_in),
+            )
         context_attn_out_cor, context_lse_cor = self.dcp_combine(
             context_attn_out,
-            context_lse.transpose(0, 1),
-            get_dcp_group(),
+            _context_lse_in,
+            _dcp_grp,
             return_lse=True,
         )
+        if _dbg:
+            logger.info(
+                "[SKYRL_DCP_DEBUG] rank%d (2) post-dcp_combine %s | %s "
+                "(reduce_scatter'd to this rank's num_heads; LSE sliced "
+                "[cp_num_heads*rank:...])",
+                _dcp_grp.rank_in_group,
+                _skyrl_t("context_attn_out_cor", context_attn_out_cor),
+                _skyrl_t("context_lse_cor(pre-T)", context_lse_cor),
+            )
         context_lse_cor = context_lse_cor.transpose(0, 1).contiguous()
+        if _dbg and _SKYRL_DCP_DEBUG_REF:
+            self._skyrl_dcp_ref_combine_check(
+                context_attn_out, context_lse, context_attn_out_cor,
+                context_lse_cor, _dcp_grp,
+            )
 
         (dcp_query_out,) = current_workspace_manager().get_simultaneous(
             ((query.shape[0], self.num_heads, self.head_size), self._dcp_dtype),
@@ -986,6 +1226,19 @@ class FlashAttentionImpl(AttentionImpl):
         )
         assert context_attn_out_cor.shape == query_attn_out.shape
         assert context_lse_cor.shape == query_lse.shape
+        if _dbg:
+            # Candidate (e): the merge of the gathered/corrected CONTEXT term with
+            # this rank's OWN new-token self-attention term. The Stage-0 harness
+            # SKIPPED this merge (folded all KV into the sharded context) and
+            # still passed — so this finish is a strong suspect. Dump both inputs.
+            logger.info(
+                "[SKYRL_DCP_DEBUG] rank%d (e) merge inputs: %s | %s | %s | %s",
+                _dcp_grp.rank_in_group,
+                _skyrl_t("context_attn_out_cor", context_attn_out_cor),
+                _skyrl_t("context_lse_cor[B,H]", context_lse_cor),
+                _skyrl_t("query_attn_out(self)", query_attn_out),
+                _skyrl_t("query_lse(self,[H,B])", query_lse),
+            )
         merge_attn_states(
             output,
             context_attn_out_cor,
@@ -993,6 +1246,12 @@ class FlashAttentionImpl(AttentionImpl):
             query_attn_out,
             query_lse,
         )
+        if _dbg:
+            logger.info(
+                "[SKYRL_DCP_DEBUG] rank%d (e) post-merge %s",
+                _dcp_grp.rank_in_group,
+                _skyrl_t("output(final)", output[:n]),
+            )
 
     def _forward_encoder_attention(
         self,
