@@ -332,6 +332,48 @@ def cp_lse_ag_out_rs(
     cp_attn_out: [ B, H, D ]
     cp_attn_lse: [ B, H ]
     """
+    # Stage-2 UNIFIED single-call probe (SKYRL_DCP_DEBUG2=1, default OFF). Builds
+    # the FULLY-CORRECT reference (gather every rank's RAW cp_attn_out + cp_attn_lse,
+    # per-slot online-softmax combine, then take this rank's reduce_scatter block)
+    # and diffs it against the ACTUAL post-reduce_scatter kernel output — all from
+    # the SAME tensors on the SAME rank in ONE call (eliminates the cross-run
+    # ambiguity of the Stage-1 dumps). Inert unless the env var is set.
+    if (
+        _os.environ.get("SKYRL_DCP_DEBUG2", "0") == "1"
+        and cp_group.world_size > 1
+        and getattr(cp_lse_ag_out_rs, "_dbg2_n", 0) < 24
+    ):
+        import logging as _logging
+
+        _lg2 = _logging.getLogger("vllm.v1.attention.ops.common")
+        try:
+            w = cp_group.world_size
+            r = cp_group.rank_in_group
+            raw = cp_attn_out.contiguous()  # [B,Hg,D] this rank's RAW FA out
+            lse_in = cp_attn_lse.contiguous()  # [B,Hg] this rank's RAW FA lse
+            raw_all = cp_group.all_gather(raw, dim=0)  # [w*B,Hg,D]
+            lse_all = cp_group.all_gather(lse_in, dim=0)  # [w*B,Hg]
+            B = raw.shape[0]
+            raw_s = torch.stack(
+                [raw_all[i * B : (i + 1) * B].float() for i in range(w)], 0
+            )  # [w,B,Hg,D]
+            lse_s = torch.stack(
+                [lse_all[i * B : (i + 1) * B].float() for i in range(w)], 0
+            )  # [w,B,Hg]
+            safe = torch.where(
+                torch.isfinite(lse_s), lse_s, torch.full_like(lse_s, -1e30)
+            )
+            g = torch.logsumexp(safe, dim=0)  # [B,Hg]
+            wts = torch.exp(safe - g.unsqueeze(0)).unsqueeze(-1)  # [w,B,Hg,1]
+            ref_full = (raw_s * wts).sum(0)  # [B,Hg,D] correct combined, all slots
+            cp_h = raw.shape[1] // w
+            ref_block = ref_full[:, r * cp_h : (r + 1) * cp_h, :]  # this rank's rs block
+            _ref_block = ref_block.detach().clone()
+            cp_lse_ag_out_rs._dbg2_n = getattr(cp_lse_ag_out_rs, "_dbg2_n", 0) + 1
+            cp_lse_ag_out_rs._dbg2_ref = _ref_block
+        except Exception as e:  # pragma: no cover - debug only
+            _lg2.info("[SKYRL_DCP_DEBUG2] (pre) err %s", e)
+            cp_lse_ag_out_rs._dbg2_ref = None
     out, lse = _cp_lse_common(
         cp_attn_out, cp_attn_lse, cp_group, ctx=ctx, is_lse_base_on_e=is_lse_base_on_e
     )
@@ -340,6 +382,31 @@ def cp_lse_ag_out_rs(
     if _dbg_rs:
         _out_pre_rs = out.detach().float().clone()  # [B,Hg,D] this rank's weighted out
     out = cp_group.reduce_scatter(out, dim=1)
+    if (
+        _os.environ.get("SKYRL_DCP_DEBUG2", "0") == "1"
+        and getattr(cp_lse_ag_out_rs, "_dbg2_ref", None) is not None
+    ):
+        import logging as _logging
+
+        _lg2 = _logging.getLogger("vllm.v1.attention.ops.common")
+        try:
+            _ref = cp_lse_ag_out_rs._dbg2_ref
+            cp_lse_ag_out_rs._dbg2_ref = None
+            _k = out.detach().float()
+            fin = torch.isfinite(_ref).all(-1) & torch.isfinite(_k).all(-1)
+            d = (_ref[fin] - _k[fin]).abs().max().item() if fin.any() else float("nan")
+            # also report the unweighted-sum baseline: if kernel == raw-sum, d_unw ~ 0
+            _lg2.info(
+                "[SKYRL_DCP_DEBUG2] (post) rank=%d UNIFIED max|kernel - "
+                "correct-online-softmax| = %.4e (SMALL ⇒ combine CORRECT; "
+                "LARGE ⇒ combine WRONG). kernel[0,0,0]=%.6f ref[0,0,0]=%.6f",
+                cp_group.rank_in_group,
+                d,
+                _k.reshape(-1)[0].item() if _k.numel() else float("nan"),
+                _ref.reshape(-1)[0].item() if _ref.numel() else float("nan"),
+            )
+        except Exception as e:  # pragma: no cover - debug only
+            _lg2.info("[SKYRL_DCP_DEBUG2] (post) err %s", e)
     if _dbg_rs:
         import logging
 
