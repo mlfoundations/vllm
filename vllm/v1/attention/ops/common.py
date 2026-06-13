@@ -256,15 +256,25 @@ def _cp_lse_common(
         # whether the gathered cross-rank LSE rows are REAL or -inf/garbage.
         try:
             cp_h_dbg = lses.shape[2] // cp_group.world_size
-            h0 = r * cp_h_dbg
-            _per_n = [lses[n, 0, h0].item() for n in range(cp_group.world_size)]
+            Hg_dbg = lses.shape[2]
+            # FULL lses[:,0,:] table: row n = rank n's LSE for EVERY head-slot.
+            # The per-head-slot global = logsumexp over n; the correct weight for
+            # head-slot h on rank r is exp(lses[r,0,h]-global_h). Reading the
+            # table shows whether head-slots OUTSIDE rank r's own block get a
+            # weight!=1 (they must, for the cross-rank sum to be a softmax).
+            tbl = [
+                [round(lses[nn, 0, hh].item(), 3) for hh in range(Hg_dbg)]
+                for nn in range(cp_group.world_size)
+            ]
             _lg.info(
-                "[SKYRL_DCP_DEBUG] (common-LSE) rank=%d b=0 h=%d lses[:,0,h]=%s "
-                "(if the OTHER rank's entry is -inf/equal-to-own ⇒ the gathered "
-                "cross-rank LSE is wrong ⇒ factor collapses to 1)",
+                "[SKYRL_DCP_DEBUG] (common-LSEtab) rank=%d cp_h=%d Hg=%d "
+                "lses[n,0,:] per n = %s (own block = [%d:%d])",
                 r,
-                h0,
-                ["%.4f" % x for x in _per_n],
+                cp_h_dbg,
+                Hg_dbg,
+                tbl,
+                r * cp_h_dbg,
+                (r + 1) * cp_h_dbg,
             )
         except Exception as e:
             _lg.info("[SKYRL_DCP_DEBUG] (common-LSE) err %s", e)
