@@ -184,7 +184,43 @@ def correct_attn_out(
         cp_rank,
     )
     const_args = {"HEAD_DIM": D, "N_ROUNDED": N, "IS_BASE_E": is_lse_base_on_e}
+    global _skyrl_common_calls
+    _dbg_corr = _SKYRL_DCP_DEBUG and _skyrl_common_calls < 60
+    if _dbg_corr:
+        _out_before = out.detach().float().clone()
     ctx.call_kernel(_correct_attn_cp_out_kernel, grid, *regular_args, **const_args)
+    if _dbg_corr:
+        import logging
+
+        _lg = logging.getLogger("vllm.v1.attention.ops.common")
+        # ACTUAL factor the kernel applied = out_after / out_before (per cell).
+        _after = out.detach().float()
+        _ratio = torch.where(
+            _out_before.abs() > 1e-6, _after / _out_before, torch.ones_like(_after)
+        )
+        # Expected factor from the SAME lses (correct online-softmax weight).
+        lf = lses.float()
+        safe = torch.where(torch.isfinite(lf), lf, torch.full_like(lf, -1e30))
+        lse_g_t = torch.logsumexp(safe, dim=0)  # [B,H]
+        exp_factor = torch.exp(safe[cp_rank] - lse_g_t)  # [B,H]
+        fin = torch.isfinite(exp_factor) & (exp_factor < 0.999)
+        if fin.any():
+            ef = exp_factor[fin]  # cells where a non-trivial weight is expected
+            # applied ratio at those (b,h), broadcast over D -> take [...,0]
+            af = _ratio[..., 0][fin]
+            _lg.info(
+                "[SKYRL_DCP_DEBUG] (corr) cp_rank=%d cells-with-expected-weight<1: "
+                "n=%d | EXPECTED factor mean=%.4f min=%.4f | KERNEL-APPLIED ratio "
+                "mean=%.4f min=%.4f max=%.4f (if APPLIED~1 while EXPECTED<1 ⇒ the "
+                "rescale is NOT landing on the output)",
+                cp_rank,
+                int(fin.sum().item()),
+                ef.mean().item(),
+                ef.min().item(),
+                af.mean().item(),
+                af.min().item(),
+                af.max().item(),
+            )
     return out, lse
 
 
