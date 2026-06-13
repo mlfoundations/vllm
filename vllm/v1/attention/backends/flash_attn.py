@@ -1444,6 +1444,71 @@ class FlashAttentionImpl(AttentionImpl):
                     if finl.any()
                     else float("nan")
                 )
+                # --- (S2) SELF-term recompute (TRUSTWORTHY, same-call, no
+                # cross-rank gather): redo the new-token self-attention in fp32
+                # directly from the SAME raw (query,key,value) the self FA used,
+                # per request (causal), and diff against query_attn_out /
+                # query_lse. This is the ONLY merge input with zero trustworthy
+                # coverage so far (combine=DEBUG2 bit-exact, ctxLSE=Lc~0,
+                # merge=M~noise). A nonzero (S2) localizes the defect to the
+                # decode self term; (S2)~0 means all merge inputs are correct
+                # and the defect is downstream of attention (output routing).
+                d_self_o = float("nan")
+                d_self_l = float("nan")
+                try:
+                    qf = query.float()  # [T, H, D]
+                    kf = key.float()  # [T, Hkv, D]
+                    vf = value.float()
+                    qsl = attn_metadata.query_start_loc
+                    sc = self.scale
+                    H = qf.shape[1]
+                    Hkv = kf.shape[1]
+                    rep = H // Hkv
+                    nreq = qsl.shape[0] - 1
+                    so_ref = torch.empty_like(qf)
+                    sl_ref = torch.empty(
+                        (H, qf.shape[0]), dtype=torch.float32, device=qf.device
+                    )
+                    for rq in range(nreq):
+                        a = int(qsl[rq].item())
+                        b = int(qsl[rq + 1].item())
+                        if b <= a:
+                            continue
+                        qx = qf[a:b]  # [t,H,D]
+                        kx = kf[a:b]  # [t,Hkv,D]
+                        vx = vf[a:b]
+                        if rep > 1:
+                            kx = kx.repeat_interleave(rep, dim=1)
+                            vx = vx.repeat_interleave(rep, dim=1)
+                        # scores [H,t,t]
+                        sco = torch.einsum(" qhd,khd->hqk", qx, kx) * sc
+                        t = b - a
+                        cm = torch.tril(
+                            torch.ones(t, t, device=qf.device, dtype=torch.bool)
+                        )
+                        sco = sco.masked_fill(~cm.unsqueeze(0), float("-inf"))
+                        lse_r = torch.logsumexp(sco, dim=-1)  # [H,t]
+                        prob = torch.softmax(sco, dim=-1)
+                        out_r = torch.einsum("hqk,khd->qhd", prob, vx)  # [t,H,D]
+                        so_ref[a:b] = out_r
+                        sl_ref[:, a:b] = lse_r
+                    qo_k = query_attn_out.float()
+                    ql_k = query_lse.float()  # [H,T]
+                    fso = torch.isfinite(so_ref).all(-1) & torch.isfinite(qo_k).all(-1)
+                    d_self_o = (
+                        (so_ref[fso] - qo_k[fso]).abs().max().item()
+                        if fso.any()
+                        else float("nan")
+                    )
+                    fsl = torch.isfinite(sl_ref) & torch.isfinite(ql_k)
+                    d_self_l = (
+                        (sl_ref[fsl] - ql_k[fsl]).abs().max().item()
+                        if fsl.any()
+                        else float("nan")
+                    )
+                except Exception as _es:  # pragma: no cover - debug only
+                    d_self_o = -1.0
+                    logger.info("[SKYRL_DCP_DEBUG3] rank%d (S2) err %s", r, _es)
                 # Per-token (decode-position) max|Δ| for the FULL ref, so the
                 # GROWTH with decode length is visible directly.
                 per_tok = (
@@ -1455,9 +1520,10 @@ class FlashAttentionImpl(AttentionImpl):
                     "[SKYRL_DCP_DEBUG3] rank%d call#%d n_tok=%d "
                     "(M)merge-only max|Δ|=%.4e  (F)full-from-raw max|Δ|=%.4e  "
                     "(C)ctx-recon-vs-kernel max|Δ|=%.4e  (Lc)ctxLSE-vs-true "
-                    "max|Δ|=%.4e  per-tok|Δ|=%s  (M~0 & F~0 ⇒ merge+terms OK; "
-                    "M~0 & F large & C~0 ⇒ SELF term/decode-self-attn defect; "
-                    "C large ⇒ (F) head-index artifact)",
+                    "max|Δ|=%.4e  (S2)self-out max|Δ|=%.4e self-lse max|Δ|=%.4e  "
+                    "per-tok|Δ|=%s  (S2~0 ⇒ self term correct, all merge inputs "
+                    "correct ⇒ defect downstream of attn; S2 large ⇒ decode "
+                    "self-attn defect)",
                     r,
                     _skyrl_dcp_debug3_calls,
                     int(n),
@@ -1465,6 +1531,8 @@ class FlashAttentionImpl(AttentionImpl):
                     d_full,
                     d_ctx,
                     d_clse,
+                    d_self_o,
+                    d_self_l,
                     ["%.3e" % x for x in per_tok[:8]],
                 )
             except Exception as _e3:  # pragma: no cover - debug only
