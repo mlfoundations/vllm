@@ -89,6 +89,24 @@ import os as _os
 
 _SKYRL_DCP_DEBUG = _os.environ.get("SKYRL_DCP_DEBUG", "0") == "1"
 _SKYRL_DCP_DEBUG_REF = _os.environ.get("SKYRL_DCP_DEBUG_REF", "0") == "1"
+# Stage-2 re-localization probe (SKYRL_DCP_DEBUG3=1, default OFF, G1-inert).
+# Single-call, same-rank, fully-correct reference for the FINAL merge of the
+# corrected CONTEXT term with this rank's NEW-TOKEN self term. Mirrors the
+# trustworthy SKYRL_DCP_DEBUG2 pattern (no cross-run compares): inside ONE
+# `_forward_with_dcp` call it rebuilds the true full attention output by an fp32
+# online-softmax of (gathered per-rank raw context partials) + (this rank's raw
+# self partial), and diffs it against the kernel's merged `output`. Also diffs
+# the merge in isolation (correct fp32 2-way merge of the kernel's OWN
+# context_attn_out_cor/context_lse_cor + query_attn_out/query_lse vs kernel
+# output) so a wrong merge is separable from a wrong context/self TERM.
+_SKYRL_DCP_DEBUG3 = _os.environ.get("SKYRL_DCP_DEBUG3", "0") == "1"
+try:
+    _SKYRL_DCP_DEBUG3_MAXCALLS = int(
+        _os.environ.get("SKYRL_DCP_DEBUG3_MAXCALLS", "200")
+    )
+except ValueError:
+    _SKYRL_DCP_DEBUG3_MAXCALLS = 200
+_skyrl_dcp_debug3_calls = 0
 try:
     _SKYRL_DCP_DEBUG_MAXCALLS = int(_os.environ.get("SKYRL_DCP_DEBUG_MAXCALLS", "4"))
 except ValueError:
@@ -1306,6 +1324,120 @@ class FlashAttentionImpl(AttentionImpl):
                 _dcp_grp.rank_in_group,
                 _skyrl_t("output(final)", output[:n]),
             )
+        # ------------------------------------------------------------------
+        # Stage-2 re-localization probe (SKYRL_DCP_DEBUG3): single-call,
+        # same-rank, fully-correct references. Two diffs, both fp32, both built
+        # from THIS call's own tensors (no cross-run ambiguity):
+        #   (M) MERGE-only: correct 2-way online softmax of the kernel's OWN
+        #       (context_attn_out_cor, context_lse_cor) + (query_attn_out,
+        #       query_lse) vs the kernel's `output`. Isolates the merge math.
+        #   (F) FULL: gather every rank's RAW context partial (out,lse) +
+        #       this rank's RAW self partial (out,lse), do the complete
+        #       (N context shards + 1 self) online softmax, vs `output`.
+        #       Isolates whether a TERM fed to the merge is itself wrong
+        #       (context-shard contents / self) even when combine+merge are OK.
+        # Per-decode-step max|Δ| growth localizes the 0.103 drift.
+        global _skyrl_dcp_debug3_calls
+        if (
+            _SKYRL_DCP_DEBUG3
+            and _skyrl_dcp_debug3_calls < _SKYRL_DCP_DEBUG3_MAXCALLS
+        ):
+            _skyrl_dcp_debug3_calls += 1
+            try:
+                r = _dcp_grp.rank_in_group
+                w = _dcp_grp.world_size
+                # --- (M) merge-only correct reference (base-e online softmax) ---
+                # context_attn_out_cor/query_attn_out: [B,H,D];
+                # context_lse_cor/query_lse: [H,B] -> transpose to [B,H].
+                co = context_attn_out_cor.float()
+                qo = query_attn_out.float()
+                cl = context_lse_cor.float().transpose(0, 1)  # [B,H]
+                ql = query_lse.float().transpose(0, 1)  # [B,H]
+                ls = torch.stack([cl, ql], dim=0)  # [2,B,H]
+                ls_safe = torch.where(
+                    torch.isfinite(ls), ls, torch.full_like(ls, -1e30)
+                )
+                g_m = torch.logsumexp(ls_safe, dim=0)  # [B,H]
+                w_c = torch.exp(ls_safe[0] - g_m).unsqueeze(-1)  # [B,H,1]
+                w_q = torch.exp(ls_safe[1] - g_m).unsqueeze(-1)
+                ref_merge = co * w_c + qo * w_q  # [B,H,D]
+                k_out = output[:n].float()
+                finm = (
+                    torch.isfinite(ref_merge).all(-1)
+                    & torch.isfinite(k_out).all(-1)
+                )
+                d_merge = (
+                    (ref_merge[finm] - k_out[finm]).abs().max().item()
+                    if finm.any()
+                    else float("nan")
+                )
+                # --- (F) full from-scratch reference (N context shards + self) ---
+                # Gather raw context partials across ranks (Hg = H*w replicated
+                # query heads), take this rank's own H-head block from each shard.
+                raw_c = context_attn_out.contiguous()  # [B,Hg,D]
+                raw_cl = context_lse.transpose(0, 1).contiguous()  # [B,Hg]
+                B = raw_c.shape[0]
+                gc_out = _dcp_grp.all_gather(raw_c, dim=0)  # [w*B,Hg,D]
+                gc_lse = _dcp_grp.all_gather(raw_cl, dim=0)  # [w*B,Hg]
+                Hg = raw_c.shape[1]
+                Hloc = Hg // w
+                # shard s's partial for THIS rank's own query heads = the
+                # [r*Hloc:(r+1)*Hloc] head-block of shard s's gathered tensor.
+                ctx_out = torch.stack(
+                    [
+                        gc_out[s * B : (s + 1) * B, r * Hloc : (r + 1) * Hloc, :].float()
+                        for s in range(w)
+                    ],
+                    0,
+                )  # [w,B,H,D]
+                ctx_lse = torch.stack(
+                    [
+                        gc_lse[s * B : (s + 1) * B, r * Hloc : (r + 1) * Hloc].float()
+                        for s in range(w)
+                    ],
+                    0,
+                )  # [w,B,H]
+                self_out = qo.unsqueeze(0)  # [1,B,H,D]
+                self_lse = ql.unsqueeze(0)  # [1,B,H]
+                all_out = torch.cat([ctx_out, self_out], 0)  # [w+1,B,H,D]
+                all_lse = torch.cat([ctx_lse, self_lse], 0)  # [w+1,B,H]
+                all_safe = torch.where(
+                    torch.isfinite(all_lse), all_lse, torch.full_like(all_lse, -1e30)
+                )
+                g_f = torch.logsumexp(all_safe, dim=0)  # [B,H]
+                wts_f = torch.exp(all_safe - g_f.unsqueeze(0)).unsqueeze(-1)
+                ref_full = (all_out * wts_f).sum(0)  # [B,H,D]
+                finf = (
+                    torch.isfinite(ref_full).all(-1) & torch.isfinite(k_out).all(-1)
+                )
+                d_full = (
+                    (ref_full[finf] - k_out[finf]).abs().max().item()
+                    if finf.any()
+                    else float("nan")
+                )
+                # Per-token (decode-position) max|Δ| for the FULL ref, so the
+                # GROWTH with decode length is visible directly.
+                per_tok = (
+                    (ref_full - k_out).abs().amax(dim=(1, 2)).tolist()
+                    if k_out.numel()
+                    else []
+                )
+                logger.info(
+                    "[SKYRL_DCP_DEBUG3] rank%d call#%d n_tok=%d "
+                    "(M)merge-only max|Δ|=%.4e  (F)full-from-raw max|Δ|=%.4e  "
+                    "per-tok|Δ|=%s  (M~0 & F~0 ⇒ merge+terms OK here; "
+                    "M~0 & F large ⇒ a context/self TERM is wrong; "
+                    "M large ⇒ merge math/inputs wrong)",
+                    r,
+                    _skyrl_dcp_debug3_calls,
+                    int(n),
+                    d_merge,
+                    d_full,
+                    ["%.3e" % x for x in per_tok[:8]],
+                )
+            except Exception as _e3:  # pragma: no cover - debug only
+                logger.info("[SKYRL_DCP_DEBUG3] rank%d probe err %s",
+                            _dcp_grp.rank_in_group, _e3)
 
     def _forward_encoder_attention(
         self,
