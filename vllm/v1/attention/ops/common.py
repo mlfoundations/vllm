@@ -210,12 +210,28 @@ def _cp_lse_common(
         (cp_group.world_size,) + cp_attn_lse.shape
     )
     global _skyrl_common_calls
-    if _SKYRL_DCP_DEBUG and _skyrl_common_calls < 8:
+    if _SKYRL_DCP_DEBUG and _skyrl_common_calls < 60:
         _skyrl_common_calls += 1
         import logging
 
         _lg = logging.getLogger("vllm.v1.attention.ops.common")
         r = cp_group.rank_in_group
+        # Raw per-(n) LSE at b=0,h=r*cp_h (this rank's first own head) to read
+        # whether the gathered cross-rank LSE rows are REAL or -inf/garbage.
+        try:
+            cp_h_dbg = lses.shape[2] // cp_group.world_size
+            h0 = r * cp_h_dbg
+            _per_n = [lses[n, 0, h0].item() for n in range(cp_group.world_size)]
+            _lg.info(
+                "[SKYRL_DCP_DEBUG] (common-LSE) rank=%d b=0 h=%d lses[:,0,h]=%s "
+                "(if the OTHER rank's entry is -inf/equal-to-own ⇒ the gathered "
+                "cross-rank LSE is wrong ⇒ factor collapses to 1)",
+                r,
+                h0,
+                ["%.4f" % x for x in _per_n],
+            )
+        except Exception as e:
+            _lg.info("[SKYRL_DCP_DEBUG] (common-LSE) err %s", e)
         # Replicate the kernel's per-cell factor in pure torch using the SAME
         # `lses` tensor (so any stride/orientation defect shows identically):
         #   lse_global = logsumexp_n(lses[n,b,h]);  factor = exp(lses[r,b,h]-lse_g)
