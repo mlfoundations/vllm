@@ -1023,6 +1023,38 @@ class FlashAttentionImpl(AttentionImpl):
                 cp_h,
                 B,
             )
+            # One-shot ELEMENT dump on the first LARGE-Δout finite cell: show the
+            # per-rank raw outputs, the per-rank weights, the REF sum, and the
+            # kernel result for head 0 of this rank's block — to read off whether
+            # the kernel summed across ranks (reduce_scatter) or kept only its
+            # own weighted output (a missing cross-rank sum / wrong head block).
+            if (
+                not getattr(self, "_skyrl_dcp_ref_elem_done", False)
+                and d_out == d_out
+                and d_out > 0.05
+            ):
+                bi = 0
+                hi = r * cp_h  # this rank's first own head (global head index)
+                # per-rank raw FA out + weight at [bi, hi, 0]
+                raw = [out_stk[s, bi, hi, 0].item() for s in range(w)]
+                wt = [wts[s, bi, hi, 0].item() for s in range(w)]
+                lse_per = [lse_stk[s, bi, hi].item() for s in range(w)]
+                ref_v = ref_out_full[bi, hi, 0].item()
+                ker_v = context_attn_out_cor.float()[bi, 0, 0].item()
+                logger.info(
+                    "[SKYRL_DCP_DEBUG] rank%d (REF-ELEM) b=0 head_global=%d d=0 | "
+                    "per-rank raw_out=%s | per-rank lse=%s | per-rank weight="
+                    "exp(lse_r-lse_g)=%s | REF sum_r(raw*wt)=%.6f | KERNEL "
+                    "context_attn_out_cor[0,0,0]=%.6f",
+                    r,
+                    hi,
+                    ["%.5f" % x for x in raw],
+                    ["%.4f" % x for x in lse_per],
+                    ["%.5f" % x for x in wt],
+                    ref_v,
+                    ker_v,
+                )
+                self._skyrl_dcp_ref_elem_done = True
         except Exception as e:  # pragma: no cover - debug only
             logger.info("[SKYRL_DCP_DEBUG] (REF) check err %s", e)
 
