@@ -37,7 +37,7 @@ from tests.dcp_gqa_repro._dcp_ref import (
 
 # Real fork combine code — a fix to these flips FAIL -> PASS without touching
 # this harness.
-from vllm.v1.attention.ops.common import CPTritonContext, cp_lse_ag_out_rs
+from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 
 
 def _dcp_combine(
@@ -69,7 +69,11 @@ def _dcp_combine(
     v_shards = list(torch.chunk(v_full, N, dim=1))
 
     # --- per-rank partial FA over its shard (FA returns lse in [Hg, B]) ---
-    ctx = CPTritonContext()
+    # NOTE: pass ctx=None into every correct_attn_out call so each launch goes
+    # through the full kernel[grid](*args, **constexpr) warmup. A *shared*
+    # CPTritonContext caches inner_kernel and replays it WITHOUT the constexpr
+    # args, which mismatches when HEAD_DIM/N_ROUNDED change across cases (Triton
+    # "takes 27 arguments (24 given)").
     per_rank_out: list[torch.Tensor] = []
     per_rank_lse_hb: list[torch.Tensor] = []
     Hg = H * N
@@ -99,7 +103,7 @@ def _dcp_combine(
         g_r = FakeCPGroup(world_size=N, rank_in_group=r)
         g_r.register_all_gather(0, per_rank_lse_bh)
         out_cor_r, _lse_cor_r = _cp_lse_common(
-            per_rank_out[r].clone(), per_rank_lse_bh[r], g_r, ctx=ctx
+            per_rank_out[r].clone(), per_rank_lse_bh[r], g_r, ctx=None
         )
         corrected_per_rank.append(out_cor_r)  # [B, Hg, D]
 
@@ -110,7 +114,7 @@ def _dcp_combine(
     # re-corrects rank-0's out identically; its reduce_scatter uses our
     # registered per-rank corrected outs).
     out0, _lse0 = cp_lse_ag_out_rs(
-        per_rank_out[0].clone(), per_rank_lse_bh[0], group, ctx=ctx, return_lse=True
+        per_rank_out[0].clone(), per_rank_lse_bh[0], group, ctx=None, return_lse=True
     )
     return out0.float()  # [B, H, D]
 

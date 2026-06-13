@@ -53,6 +53,9 @@ PY
   echo "=== standalone harness (divergence table) ==="
   python tests/dcp_gqa_repro/test_dcp_combine_parity.py
   echo "=== pytest (MHA control should PASS; GQA asserts are the repro) ==="
-  python -m pytest tests/dcp_gqa_repro/test_dcp_combine_parity.py -v -s || true
+  # --noconftest: the repo-root tests/conftest.py pulls test-only deps (tblib)
+  # absent from the SIF; the harness needs none of them.
+  python -m pytest tests/dcp_gqa_repro/test_dcp_combine_parity.py \
+      -v -s -p no:cacheprovider --noconftest --rootdir tests/dcp_gqa_repro || true
 '
 echo "=== done ==="
