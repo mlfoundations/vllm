@@ -57,7 +57,7 @@ def _build(dcp):
         tensor_parallel_size=TP,
         enforce_eager=True,
         seed=SEED,
-        dtype="bfloat16",
+        dtype=os.environ.get("DCP_PARITY_DTYPE", "bfloat16"),
         gpu_memory_utilization=0.45,
         max_model_len=2048,
         disable_log_stats=True,
