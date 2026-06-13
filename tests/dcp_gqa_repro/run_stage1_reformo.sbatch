@@ -40,6 +40,11 @@ apptainer exec --nv "$SIF" bash -lc '
   export HF_HUB_OFFLINE=1
   export VLLM_USE_FLASHINFER_SAMPLER=0
   export VLLM_ATTENTION_BACKEND=FLASH_ATTN
+  # Triton JIT links its launcher .so against -l:libcuda.so.1; the runtime stub
+  # mounted by apptainer --nv lives in /.singularity.d/libs but is NOT on gcc'"'"'s
+  # LIBRARY_PATH (only the cuda stubs dir is) -> ld "cannot find -l:libcuda.so.1".
+  # Add the --nv driver dir so the launcher links. (GH200/aarch64 gcc gotcha.)
+  export LIBRARY_PATH="/.singularity.d/libs:${LIBRARY_PATH:-}"
   # ---- Stage-1 instrumentation switches (env-gated; default OFF in source) ----
   export SKYRL_DCP_DEBUG=1
   export SKYRL_DCP_DEBUG_REF=1
