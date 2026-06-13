@@ -35,13 +35,20 @@ apptainer exec --nv "$SIF" bash -lc '
   cd "'"$REPO"'"
   export VLLM_USE_FLASHINFER_SAMPLER=0
   export PYTHONPATH="'"$REPO"'":${PYTHONPATH:-}
-  # Version asserts (env-map §2d): torch 2.11 / vllm 0.20.2rc0.
+  # Version asserts (env-map §2d): torch 2.11 + CUDA are load-bearing. The
+  # 0.20.2rc0 SIF reports a dev __version__ string (editable build), so we
+  # confirm the IMPORTED combine code resolves to THIS fork tree instead.
   python - <<PY
 import torch, vllm
+import vllm.v1.attention.ops.common as common
 print("torch", torch.__version__, "vllm", vllm.__version__, "cuda", torch.cuda.is_available())
+print("vllm pkg ->", vllm.__file__)
+print("common  ->", common.__file__)
 assert torch.__version__.startswith("2.11"), f"expected torch 2.11, got {torch.__version__}"
-assert vllm.__version__.startswith("0.20.2rc0"), f"expected vllm 0.20.2rc0, got {vllm.__version__}"
 assert torch.cuda.is_available(), "no CUDA device visible"
+assert common.__file__.startswith("'"$REPO"'"), (
+    f"combine code NOT from fork tree: {common.__file__}")
+assert hasattr(common, "cp_lse_ag_out_rs"), "cp_lse_ag_out_rs missing from fork common.py"
 PY
   echo "=== standalone harness (divergence table) ==="
   python tests/dcp_gqa_repro/test_dcp_combine_parity.py
