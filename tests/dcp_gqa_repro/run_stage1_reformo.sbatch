@@ -23,18 +23,21 @@ set -euo pipefail
 
 SIF=/e/scratch/jureap59/feuer1/containers/skyrl_megatron_vllm0202rc0_r3.sif
 REPO="${SLURM_SUBMIT_DIR:-/e/scratch/jureap59/feuer1/vllm}"
-# The SkyRL Stage-3 parity driver lives in the MarinSkyRL checkout; allow override.
-PARITY=${PARITY:-/e/scratch/jureap59/feuer1/MarinSkyRL/skyrl-train/tests/gpu/test_dcp_rollout_parity.py}
+# Standalone in-fork driver (no MarinSkyRL dependency); deploys with the branch.
+DRIVER=${DRIVER:-tests/dcp_gqa_repro/stage1_dcp_driver.py}
+export HF_HOME=/e/scratch/jureap59/feuer1/hf_cache
 cd "$REPO"
 
 echo "=== Stage-1 DCP root-cause: host=$(hostname) job=${SLURM_JOB_ID:-NA} repo=$REPO ==="
 echo "=== git: $(git rev-parse --short HEAD 2>/dev/null) branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null) ==="
-echo "=== parity driver: $PARITY ==="
+echo "=== driver: $DRIVER ==="
 
 apptainer exec --nv "$SIF" bash -lc '
   set -euo pipefail
   cd "'"$REPO"'"
   export PYTHONPATH="'"$REPO"'":${PYTHONPATH:-}
+  export HF_HOME=/e/scratch/jureap59/feuer1/hf_cache
+  export HF_HUB_OFFLINE=1
   export VLLM_USE_FLASHINFER_SAMPLER=0
   export VLLM_ATTENTION_BACKEND=FLASH_ATTN
   # ---- Stage-1 instrumentation switches (env-gated; default OFF in source) ----
@@ -61,7 +64,7 @@ assert torch.cuda.is_available(), "no CUDA device visible"
 print("instrumentation present:", fa._SKYRL_DCP_DEBUG, fa._SKYRL_DCP_DEBUG_REF, fa._SKYRL_DCP_DEBUG_MAXCALLS)
 PY
 
-  echo "=== Stage-1 real-path parity run with SKYRL_DCP_DEBUG dumps ==="
-  python "'"$PARITY"'" || true
+  echo "=== Stage-1 real-path run with SKYRL_DCP_DEBUG dumps ==="
+  python "'"$DRIVER"'" || true
 '
 echo "=== done ==="
