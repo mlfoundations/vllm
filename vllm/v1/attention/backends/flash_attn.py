@@ -1250,11 +1250,20 @@ class FlashAttentionImpl(AttentionImpl):
                 _dcp_grp.rank_in_group,
                 _skyrl_t("context_lse.transpose(0,1)[B,Hg]", _context_lse_in),
             )
+        # GQA-LSE DCP fix: ask the AG+RS combine to keep the combined context in
+        # fp32 (out_fp32=True) so the context+self merge below can run in fp32 and
+        # quantize to the model dtype only once, at the final attention output —
+        # matching the single fp32-accumulated FA call of the dcp=1 path. Only the
+        # cp_lse_ag_out_rs combine accepts out_fp32; the A2A combine combines in an
+        # fp32 register internally and returns the model dtype, so it is left as-is.
+        _combine_kwargs = {"return_lse": True}
+        if self.dcp_combine is cp_lse_ag_out_rs:
+            _combine_kwargs["out_fp32"] = True
         context_attn_out_cor, context_lse_cor = self.dcp_combine(
             context_attn_out,
             _context_lse_in,
             _dcp_grp,
-            return_lse=True,
+            **_combine_kwargs,
         )
         if _dbg:
             logger.info(
@@ -1311,13 +1320,32 @@ class FlashAttentionImpl(AttentionImpl):
                 _skyrl_t("query_attn_out(self)", query_attn_out),
                 _skyrl_t("query_lse(self,[H,B])", query_lse),
             )
-        merge_attn_states(
-            output,
-            context_attn_out_cor,
-            context_lse_cor,
-            query_attn_out,
-            query_lse,
-        )
+        # GQA-LSE DCP fix (part 2): the AG+RS combine now returns the cross-rank
+        # context term in fp32 (see cp_lse_ag_out_rs). Merge the context and the
+        # new-token self term in fp32 as well, writing into an fp32 scratch buffer,
+        # and downcast to the model-dtype `output` exactly once at the end. This
+        # keeps the whole dcp>1 attention finish (combine + merge) in fp32 and only
+        # quantizes to bf16 at the same single point the dcp=1 path does (the final
+        # attention output), removing the ~4e-2 bf16 merge-boundary quantization that
+        # otherwise flips the MoE router top-k vs dcp=1.
+        if context_attn_out_cor.dtype == torch.float32 and output.dtype != torch.float32:
+            merged_fp32 = torch.empty_like(context_attn_out_cor)
+            merge_attn_states(
+                merged_fp32,
+                context_attn_out_cor,
+                context_lse_cor,
+                query_attn_out.float(),
+                query_lse,
+            )
+            output[:n].copy_(merged_fp32)
+        else:
+            merge_attn_states(
+                output,
+                context_attn_out_cor,
+                context_lse_cor,
+                query_attn_out,
+                query_lse,
+            )
         if _dbg:
             logger.info(
                 "[SKYRL_DCP_DEBUG] rank%d (e) post-merge %s",

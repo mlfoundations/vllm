@@ -327,10 +327,18 @@ def cp_lse_ag_out_rs(
     ctx: CPTritonContext | None = None,
     return_lse: bool = False,
     is_lse_base_on_e=True,
+    out_fp32: bool = False,
 ):
     """
     cp_attn_out: [ B, H, D ]
     cp_attn_lse: [ B, H ]
+
+    out_fp32: if True, return the combined output in fp32 instead of downcasting
+        back to ``cp_attn_out``'s dtype. The cross-rank online-softmax recombine is
+        always accumulated in fp32 (see below); ``out_fp32=True`` additionally skips
+        the final downcast so a caller that immediately blends the result with
+        another partial (e.g. the FlashAttention DCP context+self merge) can keep the
+        whole finish in fp32 and quantize only once, at the final attention output.
     """
     # Stage-2 UNIFIED single-call probe (SKYRL_DCP_DEBUG2=1, default OFF). Builds
     # the FULLY-CORRECT reference (gather every rank's RAW cp_attn_out + cp_attn_lse,
@@ -374,6 +382,27 @@ def cp_lse_ag_out_rs(
         except Exception as e:  # pragma: no cover - debug only
             _lg2.info("[SKYRL_DCP_DEBUG2] (pre) err %s", e)
             cp_lse_ag_out_rs._dbg2_ref = None
+    # GQA-LSE DCP combine fix: accumulate the cross-rank online-softmax recombine
+    # in fp32, not in the bf16/fp16 attention dtype, AND return the combined context
+    # in fp32 so the downstream merge_attn_states (context + new-token self term) can
+    # also run without a bf16 round-trip. Rationale:
+    #   * correct_attn_out rescales each rank's partial by exp(lse_r - lse_global) and
+    #     reduce_scatter SUMS those rescaled partials across ranks. Doing that
+    #     rescale+sum in bf16 (the previous behavior, since cp_attn_out is the model
+    #     dtype) loses precision; FlashAttention itself accumulates the softmax in
+    #     fp32, and the A2A sibling combine (_dcp_a2a_unpack_combine_kernel) already
+    #     accumulates in an fp32 register, so AG+RS was the only DCP combine doing a
+    #     bf16 cross-rank sum.
+    #   * Downcasting the *combined* context back to bf16 before the merge re-injects a
+    #     ~4e-2 quantization (measured) at exactly the value the merge then blends with
+    #     the self term — enough, under a 128-expert top-8 MoE router, to flip top-k
+    #     and then greedy tokens vs dcp=1. Keeping the combined context fp32 lets the
+    #     caller merge in fp32 and downcast only once, at the final attention output —
+    #     matching the single fp32-accumulated FA call of the dcp=1 path.
+    # The returned LSE is already fp32 (FA emits fp32 LSE).
+    _orig_dtype = cp_attn_out.dtype
+    if _orig_dtype != torch.float32:
+        cp_attn_out = cp_attn_out.float()
     out, lse = _cp_lse_common(
         cp_attn_out, cp_attn_lse, cp_group, ctx=ctx, is_lse_base_on_e=is_lse_base_on_e
     )
@@ -382,6 +411,11 @@ def cp_lse_ag_out_rs(
     if _dbg_rs:
         _out_pre_rs = out.detach().float().clone()  # [B,Hg,D] this rank's weighted out
     out = cp_group.reduce_scatter(out, dim=1)
+    # Downcast to the input dtype unless the caller wants to keep fp32 for a
+    # subsequent fp32 merge (out_fp32=True). Default preserves the prior contract
+    # for all other DCP callers (FlashInfer, MLA).
+    if not out_fp32 and out.dtype != _orig_dtype:
+        out = out.to(_orig_dtype)
     if (
         _os.environ.get("SKYRL_DCP_DEBUG2", "0") == "1"
         and getattr(cp_lse_ag_out_rs, "_dbg2_ref", None) is not None
@@ -451,10 +485,19 @@ def cp_lse_ag_out_ar(
     cp_attn_out: [ B, H, D ]
     cp_attn_lse: [ B, H ]
     """
+    # Same fp32-accumulation fix as cp_lse_ag_out_rs: the per-rank rescale +
+    # cross-rank all_reduce sum of the online-softmax recombine must accumulate in
+    # fp32 (matching FlashAttention's internal accumulation and the A2A combine),
+    # not in the bf16/fp16 model dtype, to avoid a router-flipping combine error.
+    _orig_dtype = cp_attn_out.dtype
+    if _orig_dtype != torch.float32:
+        cp_attn_out = cp_attn_out.float()
     out, lse = _cp_lse_common(
         cp_attn_out, cp_attn_lse, cp_group, ctx=ctx, is_lse_base_on_e=is_lse_base_on_e
     )
     out = cp_group.all_reduce(out)
+    if out.dtype != _orig_dtype:
+        out = out.to(_orig_dtype)
 
     if return_lse:
         return out, lse
