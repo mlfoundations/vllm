@@ -1937,11 +1937,28 @@ class VllmConfig:
                 f"{self.parallel_config.prefill_context_parallel_size})"
             )
         if self.parallel_config.decode_context_parallel_size > 1:
-            unsupported.append(
-                "decode context parallelism "
-                f"(decode_context_parallel_size="
-                f"{self.parallel_config.decode_context_parallel_size})"
-            )
+            # DCP+R3 is out of PR#39917's validated scope, but it is not a
+            # fundamental incompatibility: MoE routing is a per-token function of
+            # each token's hidden state at the MoE layers, independent of how DCP
+            # shards the *attention* decode-KV — so each DCP rank captures routing
+            # for its own tokens and the buffer is gathered like the output tokens.
+            # Opt-in bypass (validated separately by the dcp=1-vs-dcp=2 routed-experts
+            # parity smoke for the Qwen3-Next 80B RL run). Fail-closed by default.
+            if os.environ.get("VLLM_ALLOW_ROUTED_EXPERTS_DCP", "0") == "1":
+                logger.warning_once(
+                    "VLLM_ALLOW_ROUTED_EXPERTS_DCP=1: allowing "
+                    "--enable-return-routed-experts with "
+                    "decode_context_parallel_size="
+                    f"{self.parallel_config.decode_context_parallel_size} "
+                    "(out of PR#39917 validated scope; verify routed-experts "
+                    "capture parity before trusting results)."
+                )
+            else:
+                unsupported.append(
+                    "decode context parallelism "
+                    f"(decode_context_parallel_size="
+                    f"{self.parallel_config.decode_context_parallel_size})"
+                )
         if self.scheduler_config.async_scheduling:
             unsupported.append("async scheduling")
 
