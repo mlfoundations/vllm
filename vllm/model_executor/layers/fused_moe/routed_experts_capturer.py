@@ -336,49 +336,48 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             device=device,
         )
 
-        # ---- Async D2H pipeline (rank-0 only) ----
-        # Non-rank-0 workers only need the device buffer for symmetric
-        # CUDA graph capture; they skip the D2H pipeline entirely.
+        # ---- Async D2H pipeline ----
+        # #237 FIX B (rank-symmetric epilogue): the D2H staging machinery
+        # (_device_staging / _pinned_staging / _copy_stream / _copy_event) is
+        # now allocated on EVERY rank, not just rank 0. The per-step epilogue
+        # issues the SAME GPU/stream op sequence on every TP/CP rank so no rank
+        # diverges from the collective launch schedule under enforce_eager (the
+        # job-923365 wedge). Only the HOST cache + the host-side scatter remain
+        # rank-0-only (host_cache is None on non-rank-0): non-rank-0 still does
+        # the symmetric device snapshot + pinned copy into a DISCARDED pinned
+        # buffer, but never scatters it into a host cache (GI-3: it cannot
+        # perturb what rank 0 captures). The extra per-rank cost is the staging
+        # buffers (same size as rank 0's), accepted to guarantee op symmetry.
         self._has_pending_copy = False
         self._pending_positions: np.ndarray | None = None
         self._pending_num_scheduled: dict[str, int] | None = None
         self._pending_total_tokens: int = 0
 
-        if not skip_host_cache:
-            # Same (L, N, K) layout as device_cache.buffer.
-            self._pinned_staging = torch.zeros(
-                (
-                    self.num_hidden_layers,
-                    max_num_batched_tokens,
-                    self.num_experts_per_tok,
-                ),
-                dtype=_RoutedExpertsDeviceCache.DTYPE,
-                pin_memory=True,
-            )
-            # Private device snapshot: source for the async D2H. Decouples
-            # the in-flight copy from device_cache.buffer, which the next
-            # step's MoE writes overwrite in place on main_stream.
-            self._device_staging = torch.empty_like(self.device_cache.buffer)
-            self._copy_stream = torch.cuda.Stream(device=device)
-            self._copy_event = torch.cuda.Event()
+        # Same (L, N, K) layout as device_cache.buffer.
+        self._pinned_staging = torch.zeros(
+            (
+                self.num_hidden_layers,
+                max_num_batched_tokens,
+                self.num_experts_per_tok,
+            ),
+            dtype=_RoutedExpertsDeviceCache.DTYPE,
+            pin_memory=True,
+        )
+        # Private device snapshot: source for the async D2H. Decouples
+        # the in-flight copy from device_cache.buffer, which the next
+        # step's MoE writes overwrite in place on main_stream.
+        self._device_staging = torch.empty_like(self.device_cache.buffer)
+        self._copy_stream = torch.cuda.Stream(device=device)
+        self._copy_event = torch.cuda.Event()
 
-            pinned_mb = self._pinned_staging.nbytes / _MB
-            logger.info(
-                "Routing experts pinned staging buffer allocated. "
-                "shape=%s, size=%.2f MB",
-                tuple(self._pinned_staging.shape),
-                pinned_mb,
-            )
-        else:
-            self._pinned_staging = None
-            self._device_staging = None
-            self._copy_stream = None
-            self._copy_event = None
-            logger.info(
-                "Routing experts device-only capturer (rank != 0). "
-                "Device buffer shape=%s",
-                tuple(self.device_cache.buffer.shape),
-            )
+        pinned_mb = self._pinned_staging.nbytes / _MB
+        logger.info(
+            "Routing experts D2H staging allocated (rank-symmetric, "
+            "host_cache=%s). pinned shape=%s, size=%.2f MB",
+            "None" if self.host_cache is None else "present",
+            tuple(self._pinned_staging.shape),
+            pinned_mb,
+        )
 
     def capture(self, layer_id: int, topk_ids: torch.Tensor):
         self.device_cache.capture_fwd_routed_experts(layer_id, topk_ids)
@@ -438,35 +437,53 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         positions: torch.Tensor,
         num_scheduled_tokens: dict[str, int],
     ):
-        # #237: open a per-step op record on EVERY rank (incl. non-rank-0,
-        # which early-returns below) so the harness can compare op sequences.
+        # #237 FIX B (rank-symmetric epilogue): the per-step D2H op sequence
+        # below is issued IDENTICALLY on EVERY TP/CP rank -- the main-stream
+        # snapshot, the copy-stream wait/copy/record, and the prior-copy event
+        # finalize all run on every rank regardless of `host_cache`. Only the
+        # purely-host bookkeeping (the host-cache scatter + the pending-copy
+        # metadata) is rank-0-gated, because only rank 0 owns a host cache.
+        #
+        # WHY: BEFORE FIX B, non-rank-0 ranks early-returned on `host_cache is
+        # None` while rank 0 alone issued the main-stream snapshot copy + the
+        # copy-stream wait_stream(main_stream)/pinned copy/event ops. Under
+        # enforce_eager (no CUDA graph to enforce identical op streams across
+        # ranks) that rank-0-only main-stream op skewed rank 0's collective
+        # launch timing vs ranks 1..N; on long decode the skew desynced the
+        # group inside the forward -> execute_model hang -> 900s watchdog ->
+        # EngineDead (job 923365). Mirrors FIX A (1b5a72e9a): equalize the
+        # rank-0-only work off the divergence path -- here by making every rank
+        # issue the SAME GPU/stream op set+order (true op-stream symmetry, the
+        # same property the capture_routing custom op already guarantees for the
+        # forward). The device snapshot stays on the MAIN stream so it serializes
+        # before the next step's in-place MoE buffer writes (anti-aliasing under
+        # async scheduling -- GI-3 capture correctness preserved).
         self._r3_op_step_begin()
         self._r3_op_record("sync_d2h_enter")
 
-        if self.host_cache is None:
-            self._r3_op_self_dump()
-            return
-
-        # 1. Finalize previous async copy -- the copy had an entire
-        #    forward pass to complete so event.synchronize() is ~free.
+        # 1. Finalize previous async copy. The copy-stream event sync is issued
+        #    on EVERY rank (symmetric); only rank 0 (host_cache != None) then
+        #    scatters into its host cache. The copy had an entire forward to
+        #    complete so the event sync is ~free.
         if self._has_pending_copy:
             self._r3_op_record("event_sync")
             self._copy_event.synchronize()
-            self._r3_op_record("scatter")
-            self._scatter_to_host()
             self._has_pending_copy = False
+            if self.host_cache is not None:
+                self._r3_op_record("scatter")
+                self._scatter_to_host()
 
         total_tokens = sum(num_scheduled_tokens.values())
         if total_tokens == 0:
             self._r3_op_self_dump()
             return
 
-        # 2. Snapshot the device buffer on main_stream into a private
-        #    staging buffer, then issue the D2H from the staging buffer
-        #    on a dedicated copy stream. The snapshot serializes after
-        #    the current step's MoE writes (same stream) and is private
-        #    from the next step's MoE writes, so the in-flight D2H is
-        #    not aliased by step N+1's forward under async scheduling.
+        # 2. Snapshot the device buffer on main_stream into a private staging
+        #    buffer, then issue the D2H on the dedicated copy stream. Issued on
+        #    EVERY rank (every rank has _device_staging/_pinned_staging/
+        #    _copy_stream/_copy_event after FIX B), so the op stream is identical
+        #    across ranks. The main-stream snapshot serializes after this step's
+        #    MoE writes (same stream) and is private from the next step's writes.
         main_stream = torch.cuda.current_stream(self._copy_stream.device)
         self._r3_op_record("main_copy")
         self._device_staging[:, :total_tokens, :].copy_(
@@ -481,12 +498,14 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             )
             self._r3_op_record("event_record")
             self._copy_event.record()
-
-        # 3. Save metadata for deferred scatter.
-        self._pending_positions = positions.numpy().copy()
-        self._pending_num_scheduled = num_scheduled_tokens
-        self._pending_total_tokens = total_tokens
         self._has_pending_copy = True
+
+        # 3. Save metadata for the deferred scatter -- rank 0 only (only rank 0
+        #    will scatter). Pure host bookkeeping, collective-neutral.
+        if self.host_cache is not None:
+            self._pending_positions = positions.numpy().copy()
+            self._pending_num_scheduled = num_scheduled_tokens
+            self._pending_total_tokens = total_tokens
         self._r3_op_self_dump()
 
     # ------------------------------------------------------------------
@@ -543,10 +562,18 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
 
     def finalize_pending_copy(self):
         """Ensure the most recent async D2H copy has been scattered into
-        host cache buffers.  Call before get_routed_experts."""
+        host cache buffers.  Call before get_routed_experts.
+
+        #237 FIX B: scatter is host-cache-gated (only rank 0 has a host cache);
+        non-rank-0 ranks now also carry a pending copy + event but have no host
+        cache, so they only clear the event, never scatter. In practice the
+        only caller (extract_routed_experts_for_current_batch) is already
+        host_cache-gated, so non-rank-0 does not reach here -- this guard is
+        defensive."""
         if self._has_pending_copy:
             self._copy_event.synchronize()
-            self._scatter_to_host()
+            if self.host_cache is not None:
+                self._scatter_to_host()
             self._has_pending_copy = False
 
     # ------------------------------------------------------------------

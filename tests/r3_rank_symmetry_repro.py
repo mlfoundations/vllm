@@ -129,27 +129,43 @@ def main() -> int:
         if os.path.exists(p):
             with open(p) as f:
                 logs[r] = json.load(f)
+    # The GATE compares the GPU/stream/collective-affecting op subsequence.
+    # "scatter" is pure-host numpy (rank-0-only, collective-NEUTRAL): it cannot
+    # reorder the main-stream collective launches, so it is excluded from the
+    # symmetry gate. Every other token is a GPU/stream op that MUST be issued
+    # identically on every rank (the FIX B invariant).
+    HOST_ONLY = {"scatter"}
+
+    def _coll(seq):
+        return [t for t in seq if t not in HOST_ONLY]
+
     if len(logs) == tp and flag_on:
         seqs = {r: logs[r]["op_log"] for r in logs}
-        # Per-step comparison rank0 vs each other rank.
         n_steps = min(len(s) for s in seqs.values())
         mismatch_steps = []
         for s in range(n_steps):
-            base = seqs[0][s]
+            base = _coll(seqs[0][s])
             for r in range(1, tp):
-                if seqs[r][s] != base:
-                    mismatch_steps.append((s, r, base, seqs[r][s]))
+                if _coll(seqs[r][s]) != base:
+                    mismatch_steps.append((s, r, base, _coll(seqs[r][s])))
+        # Also report the raw (incl. host-only) rank-0 vs rank-1 example.
+        example = {r: seqs[r][0] if seqs[r] else [] for r in seqs}
         print(
             f"[repro] OPCOUNT SUMMARY: steps_logged_per_rank="
             f"{ {r: len(seqs[r]) for r in seqs} } "
-            f"first_5_mismatches={mismatch_steps[:5]} "
-            f"total_mismatch_steps={len(mismatch_steps)}",
+            f"collective_mismatch_steps={len(mismatch_steps)} "
+            f"first_3_mismatches={mismatch_steps[:3]} "
+            f"step0_raw_per_rank={example}",
             flush=True,
         )
         if mismatch_steps:
-            print("[repro] RESULT=MISMATCH (rank op-sequences DIVERGE)", flush=True)
+            print("[repro] RESULT=MISMATCH (collective op-sequences DIVERGE)", flush=True)
         else:
-            print("[repro] RESULT=SYMMETRIC (rank op-sequences IDENTICAL)", flush=True)
+            print(
+                "[repro] RESULT=SYMMETRIC (collective op-sequences IDENTICAL "
+                "across all ranks every step)",
+                flush=True,
+            )
     print("[repro] DONE", flush=True)
     return 0
 
