@@ -314,8 +314,9 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         self._r3_rank = -1
         if _r3_opcount_enabled():
             with contextlib.suppress(Exception):
-                if torch.distributed.is_available() and torch.distributed.is_initialized():
-                    self._r3_rank = torch.distributed.get_rank()
+                dist = torch.distributed
+                if dist.is_available() and dist.is_initialized():
+                    self._r3_rank = dist.get_rank()
 
         if skip_host_cache:
             self.host_cache = None

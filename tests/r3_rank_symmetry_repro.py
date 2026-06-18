@@ -166,7 +166,7 @@ def main() -> int:
             flush=True,
         )
         if mismatch_steps:
-            print("[repro] RESULT=MISMATCH (collective op-sequences DIVERGE)", flush=True)
+            print("[repro] RESULT=MISMATCH (collective op-seqs DIVERGE)", flush=True)
         else:
             print(
                 "[repro] RESULT=SYMMETRIC (collective op-sequences IDENTICAL "
