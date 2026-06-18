@@ -333,6 +333,92 @@ class Worker(WorkerBase):
             # If usage stat is enabled, collect relevant info.
             report_usage_stats(self.vllm_config)
 
+        # NOTE(#232 INSTRUMENT — TP-rank-desync wedge faulthandler watchdog):
+        # py-spy/gdb/ptrace are blocked in this environment and NCCL's
+        # flight-recorder never fires on the LAGGING rank (it has nothing
+        # in-flight to time out), so on a wedge we get NO per-rank Python stack.
+        # Arm an IN-PROCESS faulthandler watchdog so that when ANY step hangs
+        # longer than the dump interval, EVERY rank (including the stuck one)
+        # dumps ALL its thread stacks to a per-rank file BEFORE the engine is
+        # torn down. Also install a SIGUSR1 handler so a live wedge can be
+        # dumped manually with `kill -SIGUSR1 <worker_pid>`.
+        # Observability only; no behavior change. Gated on env (default ON for
+        # #232 repro) so it can be disabled without a rebuild.
+        self._arm_wedge232_faulthandler()
+
+    def _arm_wedge232_faulthandler(self) -> None:
+        """#232 instrumentation: arm a periodic faulthandler traceback dump
+        + a SIGUSR1 manual-dump handler, writing per-rank stack files.
+
+        Controlled by env:
+          VLLM_WEDGE232_FAULTHANDLER   (default "1"; set "0" to disable)
+          VLLM_WEDGE232_DUMP_SECS      (default "300"; interval below the
+                                        NCCL 600s / vLLM 900s watchdogs)
+          VLLM_WEDGE232_DUMP_DIR       (default
+              "/e/data1/datasets/playground/ot-baf/wedge232_stacks")
+        A healthy step is ~20-40s, so a 300s repeating dump only fires on a
+        genuine wedge. The dump file handle is kept open for the lifetime of
+        the process (faulthandler requires the fd to stay valid)."""
+        try:
+            if os.environ.get("VLLM_WEDGE232_FAULTHANDLER", "1") != "1":
+                return
+            import datetime
+            import faulthandler
+            import signal
+            import socket
+
+            dump_dir = os.environ.get(
+                "VLLM_WEDGE232_DUMP_DIR",
+                "/e/data1/datasets/playground/ot-baf/wedge232_stacks",
+            )
+            try:
+                secs = float(os.environ.get("VLLM_WEDGE232_DUMP_SECS", "300"))
+            except ValueError:
+                secs = 300.0
+
+            os.makedirs(dump_dir, exist_ok=True)
+            node = socket.gethostname()
+            pid = os.getpid()
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            # Per-rank file. global_rank == self.rank; include node+pid so two
+            # ranks colocated on a node never collide.
+            fname = os.path.join(
+                dump_dir, f"rank_{self.rank}_{node}_pid{pid}.txt"
+            )
+            # Keep the fd open for the whole process lifetime (faulthandler
+            # writes to it asynchronously from the watchdog thread).
+            self._wedge232_dump_fh = open(fname, "a", buffering=1)
+            hdr = (
+                f"\n===== wedge232 faulthandler ARMED rank={self.rank} "
+                f"node={node} pid={pid} ts={ts} interval={secs}s =====\n"
+            )
+            self._wedge232_dump_fh.write(hdr)
+            self._wedge232_dump_fh.flush()
+
+            # Periodic dump on hang (fires on every step that runs > secs).
+            faulthandler.dump_traceback_later(
+                secs, repeat=True, file=self._wedge232_dump_fh
+            )
+
+            # Manual trigger: kill -SIGUSR1 <pid> dumps all thread stacks now.
+            faulthandler.register(
+                signal.SIGUSR1,
+                file=self._wedge232_dump_fh,
+                all_threads=True,
+                chain=False,
+            )
+            logger.info(
+                "#232 faulthandler watchdog ARMED rank=%d node=%s pid=%d "
+                "interval=%.0fs file=%s (SIGUSR1 manual dump enabled)",
+                self.rank,
+                node,
+                pid,
+                secs,
+                fname,
+            )
+        except Exception as e:  # never let instrumentation break the worker
+            logger.warning("#232 faulthandler arm FAILED: %r", e)
+
     # FIXME(youkaichao & ywang96): Use TorchDispatchMode instead of memory pool
     # to hijack tensor allocation.
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
