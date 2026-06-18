@@ -391,6 +391,36 @@ class MultiprocExecutor(Executor):
                         f"Worker failed with error '{result}', please check the"
                         " stack trace above for the root cause"
                     )
+                # [#232] If the worker split off a large R3 routed_experts
+                # payload, it is the immediately-following message on this same
+                # ring. Dequeue it under a SEPARATE (generous) timeout — NOT the
+                # execute_model deadline — and re-attach so the scheduler sees
+                # the identical routed_experts_dict. A slow/contended 96MB
+                # transfer here can no longer trip the execute_model RPC timeout
+                # that was killing EngineCores.
+                if (
+                    isinstance(result, ModelRunnerOutput)
+                    and result.routed_experts_deferred
+                ):
+                    side_timeout = float(
+                        envs.VLLM_ROUTED_EXPERTS_SIDE_TIMEOUT_SECONDS
+                    )
+                    try:
+                        re_status, re_payload = mq.dequeue(timeout=side_timeout)
+                    except TimeoutError as e:
+                        raise TimeoutError(
+                            f"RPC call to {method} timed out waiting for the "
+                            "deferred R3 routed_experts payload "
+                            f"(VLLM_ROUTED_EXPERTS_SIDE_TIMEOUT_SECONDS="
+                            f"{side_timeout})."
+                        ) from e
+                    if re_status != WorkerProc.ResponseStatus.ROUTED_EXPERTS:
+                        raise RuntimeError(
+                            "Expected a ROUTED_EXPERTS side message after a "
+                            f"deferred ModelRunnerOutput, got {re_status}."
+                        )
+                    result.routed_experts_dict = re_payload
+                    result.routed_experts_deferred = False
                 responses.append(result)
             return responses[0] if output_rank is not None else responses
 
@@ -909,21 +939,61 @@ class WorkerProc:
     class ResponseStatus(Enum):
         SUCCESS = auto()
         FAILURE = auto()
+        # [#232] A standalone, large R3 routed_experts payload published AFTER
+        # the SUCCESS ModelRunnerOutput it belongs to. See enqueue_output.
+        ROUTED_EXPERTS = auto()
 
     def enqueue_output(self, output: Any):
         """Prepares output from the worker and enqueues it to the
         worker_response_mq. If the output is an Exception, it is
         converted to a FAILURE response.
+
+        [#232] R3 routed-experts transport: the routed_experts_dict on a
+        ModelRunnerOutput can reach ~96MB at 131k ctx (one finishing seq).
+        Enqueuing the full output inline makes that giant pickle+shm write the
+        per-step (execute_model-deadline-governed) read on the driver, which at
+        long ctx / high concurrency starves the single-reader ring past the
+        spin window -> 900s execute_model timeout -> EngineCore death ->
+        retry-storm. To take the big payload off that deadline path we split it:
+        send the SMALL ModelRunnerOutput first (with routed_experts_dict=None and
+        routed_experts_deferred=True), then send the dict as a SEPARATE
+        ROUTED_EXPERTS message. The driver reads the small output under the
+        execute_model deadline, then dequeues the big payload under a separate
+        (generous) timeout and re-attaches it before the scheduler sees it.
+        Ordering is FIFO on the single ring, so the small output is always read
+        first and the dict is guaranteed to be the immediately-following message.
         """
         if isinstance(output, AsyncModelRunnerOutput):
             output = output.get_output()
 
         if isinstance(output, Exception):
             result = (WorkerProc.ResponseStatus.FAILURE, str(output))
-        else:
-            result = (WorkerProc.ResponseStatus.SUCCESS, output)
-        if (response_mq := self.worker_response_mq) is not None:
-            response_mq.enqueue(result)
+            if (response_mq := self.worker_response_mq) is not None:
+                response_mq.enqueue(result)
+            return
+
+        if (response_mq := self.worker_response_mq) is None:
+            return
+
+        # Split off a non-empty routed_experts_dict so the per-step output
+        # stays small. Only the unique reply rank (driver worker) ever carries
+        # a non-empty dict, so this is a single-writer split.
+        deferred_routed_experts = None
+        if (
+            isinstance(output, ModelRunnerOutput)
+            and output.routed_experts_dict is not None
+        ):
+            deferred_routed_experts = output.routed_experts_dict
+            output.routed_experts_dict = None
+            output.routed_experts_deferred = True
+
+        response_mq.enqueue((WorkerProc.ResponseStatus.SUCCESS, output))
+        if deferred_routed_experts is not None:
+            # Published AFTER the small output. The driver only reads this when
+            # the preceding output set routed_experts_deferred=True.
+            response_mq.enqueue(
+                (WorkerProc.ResponseStatus.ROUTED_EXPERTS, deferred_routed_experts)
+            )
 
     def handle_output(self, output: Any):
         """Handles output from the worker. If async scheduling is enabled,

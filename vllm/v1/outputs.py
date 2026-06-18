@@ -201,6 +201,16 @@ class ModelRunnerOutput:
     # req_id -> routed experts ndarray of shape (seq_len, num_moe_layers, top_k)
     routed_experts_dict: dict[str, np.ndarray] | None = None
 
+    # [#232] When True, the (large) routed_experts_dict for this step is NOT
+    # carried inline on this object; it was published as a SEPARATE message on
+    # worker_response_mq AFTER this ModelRunnerOutput, and the driver must
+    # dequeue + re-attach it (see MultiprocExecutor.collective_rpc). This keeps
+    # the big R3 payload off the execute_model-deadline read path so a slow
+    # 96MB-at-131k transfer cannot trip the EngineCore-killing RPC timeout.
+    # Transport-only; None/False on every path that does not split the payload,
+    # and always cleared (dict re-attached) before the scheduler sees it.
+    routed_experts_deferred: bool = False
+
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None
 

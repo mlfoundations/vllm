@@ -193,6 +193,7 @@ if TYPE_CHECKING:
     VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS: int = 1
     VLLM_MQ_MAX_CHUNK_BYTES_MB: int = 16
     VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: int = 300
+    VLLM_ROUTED_EXPERTS_SIDE_TIMEOUT_SECONDS: int = 1200
     VLLM_KV_CACHE_LAYOUT: Literal["NHD", "HND"] | None = None
     VLLM_SSM_CONV_STATE_LAYOUT: Literal["SD", "DS"] | None = None
     VLLM_COMPUTE_NANS_IN_LOGITS: bool = False
@@ -1435,6 +1436,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS": lambda: int(
         os.getenv("VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS", "300")
     ),
+    # [#232] Timeout in seconds for the driver to dequeue the (large) R3
+    # routed_experts payload from worker_response_mq. This is a SEPARATE
+    # message that the worker enqueues AFTER the small per-step
+    # ModelRunnerOutput, so a slow/contended 96MB-at-131k routed-experts
+    # transfer is NOT governed by the execute_model deadline and cannot trip
+    # the EngineCore-killing execute_model RPC timeout. Generous by design.
+    "VLLM_ROUTED_EXPERTS_SIDE_TIMEOUT_SECONDS": lambda: int(
+        os.getenv("VLLM_ROUTED_EXPERTS_SIDE_TIMEOUT_SECONDS", "1200")
+    ),
     # KV Cache layout used throughout vllm.
     # Some common values are:
     # - NHD
@@ -1869,6 +1879,7 @@ def compile_factors() -> dict[str, object]:
 
     ignored_factors: set[str] = {
         "MAX_JOBS",
+        "VLLM_ROUTED_EXPERTS_SIDE_TIMEOUT_SECONDS",
         "VLLM_RPC_BASE_PATH",
         "VLLM_USE_MODELSCOPE",
         "VLLM_RINGBUFFER_WARNING_INTERVAL",
