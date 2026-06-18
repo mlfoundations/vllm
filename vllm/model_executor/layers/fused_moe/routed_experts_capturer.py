@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 from abc import ABC, abstractmethod
 
 import numpy as np
@@ -13,6 +14,24 @@ import torch.distributed
 from vllm.config.model import ModelConfig
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Per-rank op-issuance counter (#237 — TP-rank-symmetry localization/gate).
+#
+# Test instrumentation ONLY. Off by default; enabled with VLLM_R3_OPCOUNT=1.
+# When OFF this is a byte-identical no-op (the env check short-circuits before
+# touching any state), preserving GI-1. When ON, each capturer instance records
+# the ordered sequence of GPU/stream/collective-affecting ops it issues in the
+# per-step R3 epilogue, so a TP/CP harness can compare rank-0 vs rank-N op
+# sequences and detect the divergence that desyncs the collective schedule.
+# ptrace is blocked in the SIF and NCCL FR did not dump on the wedge, so an
+# observable op-sequence counter is the only viable cheap localization signal.
+# ---------------------------------------------------------------------------
+
+
+def _r3_opcount_enabled() -> bool:
+    return os.environ.get("VLLM_R3_OPCOUNT", "0") == "1"
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +240,11 @@ class RoutedExpertsCapturer(ABC):
     def get_device_cache(self):
         raise NotImplementedError
 
+    def get_r3_op_log(self) -> list[list[str]]:
+        # #237 op-issuance counter (test instrumentation); empty unless the
+        # real capturer recorded ops with VLLM_R3_OPCOUNT=1.
+        return []
+
 
 def _count_moe_layers(hf_config) -> int:
     """Count the number of MoE layers in a model.
@@ -273,6 +297,11 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         self.max_num_batched_tokens = max_num_batched_tokens
         self.max_model_len = max_model_len
         self._skip_host_cache = skip_host_cache
+
+        # #237 op-issuance counter (test instrumentation; off by default).
+        # _r3_op_log[step_idx] == ordered list of op tokens issued that step.
+        self._r3_op_log: list[list[str]] = []
+        self._r3_cur_step_ops: list[str] | None = None
 
         if skip_host_cache:
             self.host_cache = None
@@ -341,6 +370,27 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         self.device_cache.capture_fwd_routed_experts(layer_id, topk_ids)
 
     # ------------------------------------------------------------------
+    # #237 op-issuance counter helpers (test instrumentation; off by default)
+    # ------------------------------------------------------------------
+
+    def _r3_op_step_begin(self) -> None:
+        """Open a new per-step op-issuance record (counter ON only)."""
+        if not _r3_opcount_enabled():
+            self._r3_cur_step_ops = None
+            return
+        self._r3_cur_step_ops = []
+        self._r3_op_log.append(self._r3_cur_step_ops)
+
+    def _r3_op_record(self, op: str) -> None:
+        """Append one op token to the current step's record (counter ON only)."""
+        if self._r3_cur_step_ops is not None:
+            self._r3_cur_step_ops.append(op)
+
+    def get_r3_op_log(self) -> list[list[str]]:
+        """Return the recorded per-step op-issuance sequences (test gate)."""
+        return self._r3_op_log
+
+    # ------------------------------------------------------------------
     # sync_fwd_experts_buffer_DtoH -- called AFTER the forward pass
     # ------------------------------------------------------------------
 
@@ -349,13 +399,20 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         positions: torch.Tensor,
         num_scheduled_tokens: dict[str, int],
     ):
+        # #237: open a per-step op record on EVERY rank (incl. non-rank-0,
+        # which early-returns below) so the harness can compare op sequences.
+        self._r3_op_step_begin()
+        self._r3_op_record("sync_d2h_enter")
+
         if self.host_cache is None:
             return
 
         # 1. Finalize previous async copy -- the copy had an entire
         #    forward pass to complete so event.synchronize() is ~free.
         if self._has_pending_copy:
+            self._r3_op_record("event_sync")
             self._copy_event.synchronize()
+            self._r3_op_record("scatter")
             self._scatter_to_host()
             self._has_pending_copy = False
 
@@ -370,14 +427,18 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         #    from the next step's MoE writes, so the in-flight D2H is
         #    not aliased by step N+1's forward under async scheduling.
         main_stream = torch.cuda.current_stream(self._copy_stream.device)
+        self._r3_op_record("main_copy")
         self._device_staging[:, :total_tokens, :].copy_(
             self.device_cache.buffer[:, :total_tokens, :], non_blocking=True
         )
         with torch.cuda.stream(self._copy_stream):
+            self._r3_op_record("copystream_wait")
             self._copy_stream.wait_stream(main_stream)
+            self._r3_op_record("pinned_copy")
             self._pinned_staging[:, :total_tokens, :].copy_(
                 self._device_staging[:, :total_tokens, :], non_blocking=True
             )
+            self._r3_op_record("event_record")
             self._copy_event.record()
 
         # 3. Save metadata for deferred scatter.
