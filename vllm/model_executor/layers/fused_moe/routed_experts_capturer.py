@@ -34,6 +34,14 @@ def _r3_opcount_enabled() -> bool:
     return os.environ.get("VLLM_R3_OPCOUNT", "0") == "1"
 
 
+def _r3_opcount_dir() -> str | None:
+    """Dir to self-dump per-rank op logs (counter ON only). Avoids needing a
+    serializable collective_rpc — each worker writes its own rank file."""
+    if not _r3_opcount_enabled():
+        return None
+    return os.environ.get("VLLM_R3_OPCOUNT_DIR") or None
+
+
 # ---------------------------------------------------------------------------
 # Custom op for routing capture -- traceable by torch.compile / Dynamo.
 #
@@ -302,6 +310,12 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         # _r3_op_log[step_idx] == ordered list of op tokens issued that step.
         self._r3_op_log: list[list[str]] = []
         self._r3_cur_step_ops: list[str] | None = None
+        # Best-effort rank tag for the self-dump file (counter ON only).
+        self._r3_rank = -1
+        if _r3_opcount_enabled():
+            with contextlib.suppress(Exception):
+                if torch.distributed.is_available() and torch.distributed.is_initialized():
+                    self._r3_rank = torch.distributed.get_rank()
 
         if skip_host_cache:
             self.host_cache = None
@@ -390,6 +404,31 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         """Return the recorded per-step op-issuance sequences (test gate)."""
         return self._r3_op_log
 
+    def _r3_op_self_dump(self) -> None:
+        """Write this rank's cumulative op log to a per-rank file (counter ON +
+        VLLM_R3_OPCOUNT_DIR set). Called at the end of each step so the harness
+        can read it after the run without a serializable collective_rpc."""
+        out = _r3_opcount_dir()
+        if out is None:
+            return
+        with contextlib.suppress(Exception):
+            import json as _json
+
+            os.makedirs(out, exist_ok=True)
+            rec = {
+                "rank": self._r3_rank,
+                "capturer_type": type(self).__name__,
+                "skip_host_cache": self._skip_host_cache,
+                "host_cache_is_none": self.host_cache is None,
+                "num_steps_logged": len(self._r3_op_log),
+                "op_log": self._r3_op_log,
+            }
+            tmp = os.path.join(out, f"oplog_rank{self._r3_rank}.json.tmp")
+            final = os.path.join(out, f"oplog_rank{self._r3_rank}.json")
+            with open(tmp, "w") as f:
+                _json.dump(rec, f, indent=2)
+            os.replace(tmp, final)
+
     # ------------------------------------------------------------------
     # sync_fwd_experts_buffer_DtoH -- called AFTER the forward pass
     # ------------------------------------------------------------------
@@ -405,6 +444,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         self._r3_op_record("sync_d2h_enter")
 
         if self.host_cache is None:
+            self._r3_op_self_dump()
             return
 
         # 1. Finalize previous async copy -- the copy had an entire
@@ -418,6 +458,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
 
         total_tokens = sum(num_scheduled_tokens.values())
         if total_tokens == 0:
+            self._r3_op_self_dump()
             return
 
         # 2. Snapshot the device buffer on main_stream into a private
@@ -446,6 +487,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         self._pending_num_scheduled = num_scheduled_tokens
         self._pending_total_tokens = total_tokens
         self._has_pending_copy = True
+        self._r3_op_self_dump()
 
     # ------------------------------------------------------------------
     # Optimized scatter into pre-allocated host-cache buffers

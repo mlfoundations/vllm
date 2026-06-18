@@ -34,40 +34,6 @@ import sys
 import numpy as np
 
 
-def _worker_dump_op_log(worker):
-    """Run on EACH TP worker via collective_rpc. Writes this rank's op log."""
-    import json as _json
-    import os as _os
-
-    from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
-        get_global_experts_capturer,
-    )
-
-    out = _os.environ.get("R3_OUT", "/tmp/r3_opcount")
-    _os.makedirs(out, exist_ok=True)
-    cap = get_global_experts_capturer()
-    op_log = []
-    cap_type = type(cap).__name__
-    try:
-        op_log = cap.get_r3_op_log()
-    except Exception as e:  # noqa: BLE001
-        op_log = [["ERR", repr(e)]]
-    rank = getattr(worker, "rank", -1)
-    skip_host = getattr(cap, "_skip_host_cache", None)
-    host_cache_is_none = getattr(cap, "host_cache", "NA") is None
-    rec = {
-        "rank": rank,
-        "capturer_type": cap_type,
-        "skip_host_cache": skip_host,
-        "host_cache_is_none": host_cache_is_none,
-        "num_steps_logged": len(op_log),
-        "op_log": op_log,
-    }
-    with open(_os.path.join(out, f"oplog_rank{rank}.json"), "w") as f:
-        _json.dump(rec, f, indent=2)
-    return rank, cap_type, len(op_log)
-
-
 def main() -> int:
     from vllm import LLM, SamplingParams
 
@@ -83,6 +49,8 @@ def main() -> int:
     steps = int(os.environ.get("R3_STEPS", "64"))
     mode = os.environ.get("R3_REPRO_MODE", "opcount")
     os.makedirs(out, exist_ok=True)
+    # Workers (spawned by LLM()) inherit this; capturer self-dumps op logs here.
+    os.environ.setdefault("VLLM_R3_OPCOUNT_DIR", out)
 
     print(
         f"[repro] model={model} tp={tp} R3={'ON' if flag_on else 'OFF'} "
@@ -105,6 +73,10 @@ def main() -> int:
         dtype="bfloat16",
         trust_remote_code=True,
         seed=1234,
+        # R3 capture is not validated with async scheduling on this build
+        # (engine rejects the combo). Async scheduling is orthogonal to the
+        # TP-rank op-issuance asymmetry we are localizing, so disable it.
+        async_scheduling=False,
     )
 
     # Mixed batch: a couple of long prompts (prefill over many 256-token chunks)
@@ -142,9 +114,13 @@ def main() -> int:
         np.savez(os.path.join(capdir, "captured.npz"), **arrs)
         print(f"[repro] capture: wrote {len(arrs)} arrays to {capdir}", flush=True)
 
-    # Dump per-rank op logs from EVERY TP worker.
-    results = llm.collective_rpc(_worker_dump_op_log)
-    print(f"[repro] collective_rpc op-log dump: {results}", flush=True)
+    # Per-rank op logs are SELF-DUMPED by each TP worker's capturer to
+    # VLLM_R3_OPCOUNT_DIR (== R3_OUT) at each step (no serializable RPC needed,
+    # which V1's collective_rpc cannot do for a raw function). Give the last
+    # in-flight async dump a moment to land, then read them.
+    import time
+
+    time.sleep(2)
 
     # Local-side comparison summary (also re-done by the analyzer).
     logs = {}
