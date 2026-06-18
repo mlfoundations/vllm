@@ -552,8 +552,20 @@ class WorkerProc:
                 input_shm_handle, self.worker.rank
             )
 
-            # Initializes a message queue for sending the model output
-            self.worker_response_mq = MessageQueue(1, 1)
+            # Initializes a message queue for sending the model output.
+            # [#232 patch] The R3 routed_experts_dict on ModelRunnerOutput can
+            # reach ~96MB at 131k ctx, overflowing the hardcoded 24MB default
+            # chunk -> shm_broadcast OOB/overflow path wedges -> EngineDead.
+            # Size this response queue from VLLM_MQ_MAX_CHUNK_BYTES_MB but floor
+            # it at 160MB so the giant payload stays on the in-ring path (no
+            # overflow flag / zmq side-channel ordering deadlock).
+            _resp_chunk_bytes = max(
+                envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024,
+                160 * 1024 * 1024,
+            )
+            self.worker_response_mq = MessageQueue(
+                1, 1, max_chunk_bytes=_resp_chunk_bytes
+            )
             self.peer_response_handles = []
         else:
             # Initialize remote MessageQueue for receiving SchedulerOutput across nodes
