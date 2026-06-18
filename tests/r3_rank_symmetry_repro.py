@@ -102,6 +102,13 @@ def main() -> int:
             flush=True,
         )
 
+    # Always dump generated token ids -> lets G-PARITY assert patched-flag-off
+    # is token-identical to stock-flag-off (no-op equivalence), and G-CAPTURE
+    # assert the decode trace itself is identical pre vs post FIX B.
+    tok = {f"seq{i}": np.asarray(o.outputs[0].token_ids) for i, o in enumerate(outs)}
+    np.savez(os.path.join(out, "tokens.npz"), **tok)
+    print(f"[repro] wrote {len(tok)} token-id arrays to {out}/tokens.npz", flush=True)
+
     if mode == "capture":
         # Stage 3 G-CAPTURE: dump captured arrays (rank-0 only has them).
         capdir = os.path.join(out, "captures")
