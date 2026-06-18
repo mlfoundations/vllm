@@ -4114,45 +4114,6 @@ class GPUModelRunner(
             self.model_config.is_encoder_decoder and num_encoder_reqs > 0
         )
 
-        # NOTE(#232 INSTRUMENT — TP-rank-desync wedge per-step divergence log):
-        # The wedge fires on a RARE mixed chunked-prefill + decode step (e.g.
-        # 15 decodes of 1 token + 1 prefill chunk of ~52 tokens) where one TP
-        # rank takes a different collective path (reaches the LM-head AllGather
-        # while a lagging rank is still issuing per-layer AllReduces). Log the
-        # batch composition right before the forward (which contains the
-        # per-layer AllReduces + the LM-head vocab-parallel AllGather), rank-
-        # tagged, so the LAST line each rank emits before diverging tells us
-        # which rank saw what mix. To avoid flooding, only log on a MIXED step
-        # (a prefill chunk co-scheduled with >=1 decode) — the wedge precondition.
-        # Observability only. Gated on env (default ON for #232 repro).
-        try:
-            if os.environ.get("VLLM_WEDGE232_STEPLOG", "1") == "1":
-                _n_dec = int((num_scheduled_tokens_np == 1).sum())
-                _n_prefill = int((num_scheduled_tokens_np > 1).sum())
-                # AllReduce element count ~= tokens * hidden_size (per layer);
-                # this is what shows up as `count=` in the NCCL COLL trace.
-                _hidden_size = getattr(
-                    self.model_config.hf_text_config, "hidden_size", 0
-                )
-                if _n_prefill >= 1 and _n_dec >= 1:
-                    logger.info(
-                        "#232 STEP tp_rank=%d MIXED num_reqs=%d "
-                        "num_sched_tokens=%d decodes=%d prefill_chunks=%d "
-                        "max_tok_in_req=%d allreduce_count=%d "
-                        "(prefill_chunk_sizes=%s)",
-                        get_tp_group().rank_in_group,
-                        num_reqs,
-                        num_tokens_unpadded,
-                        _n_dec,
-                        _n_prefill,
-                        max_num_scheduled_tokens,
-                        int(num_tokens_unpadded) * int(_hidden_size),
-                        num_scheduled_tokens_np[num_scheduled_tokens_np > 1].tolist(),
-                    )
-        except Exception:
-            # never let instrumentation break the forward path
-            pass
-
         # Run the model.
         # Use persistent buffers for CUDA graphs.
         # When spec decode is enabled, defer connector finalization
