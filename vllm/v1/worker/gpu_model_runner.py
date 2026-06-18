@@ -56,7 +56,6 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     extract_routed_experts_for_current_batch,
     free_routing_buffers,
-    get_global_experts_capturer,
     init_routed_experts_capturer_with_shared_cache,
     issue_routing_d2h_copy,
 )
@@ -3869,10 +3868,28 @@ class GPUModelRunner(
                 "after execute_model() returns None."
             )
 
-        if self.routed_experts_initialized:
-            capturer = get_global_experts_capturer()
-            if capturer is not None:
-                capturer.finalize_pending_copy()
+        # NOTE(#232 FIX A — TP-rank-desync wedge): do NOT finalize the deferred R3
+        # async D2H copy here, at the TOP of execute_model (pre-forward).
+        # finalize_pending_copy() does a host-side `self._copy_event.synchronize()`
+        # ONLY on rank 0 (non-rank-0 capturers have host_cache=None and no pending
+        # copy, so they fall straight through). Under enforce_eager (no CUDA graph
+        # to enforce identical op streams), that rank-0-only host serialization at
+        # the step boundary skews rank 0's collective launch timing relative to the
+        # other TP ranks; on a rare mixed chunked-prefill+decode step the skew is
+        # large enough that the ranks desync inside the forward (ranks reach the
+        # LM-head AllGather while a lagging rank is still on a prior AllReduce) and
+        # execute_model hangs -> vLLM 900s watchdog -> EngineDead (job 919724 repro).
+        #
+        # This call is REDUNDANT for correctness: the ONLY reader of the host cache
+        # is extract_routed_experts_for_current_batch() (later in this same step),
+        # which calls capturer.finalize_pending_copy() itself before reading. Any
+        # still-pending copy from the previous step is ALSO finalized in this step's
+        # epilogue by issue_routing_d2h_copy() -> sync_fwd_experts_buffer_DtoH()
+        # (which finalizes the prior pending copy before issuing the new one). So the
+        # host scatter still happens, just off the critical pre-collective path, in
+        # the epilogue where non-rank-0 ranks already no-op identically. Captured
+        # buffer contents and per-request host scatter are byte-for-byte unchanged;
+        # only rank 0's cross-step stream-sync TIMING is equalized vs its TP peers.
 
         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
         # the modification has influence on the scheduler_output in engine core process.
