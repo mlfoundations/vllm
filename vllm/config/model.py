@@ -433,9 +433,6 @@ class ModelConfig:
         """Apply dict overrides, handling both nested configs and dict values."""
         from transformers import PretrainedConfig
 
-        from vllm.transformers_utils.config import patch_rope_parameters
-
-        applied_rope_override = False
         for key, value in overrides.items():
             attr = getattr(config, key, None)
             if attr is not None and isinstance(attr, PretrainedConfig):
@@ -444,28 +441,6 @@ class ModelConfig:
             else:
                 # It's a dict-valued parameter - set it directly
                 setattr(config, key, value)
-            if key in ("rope_scaling", "rope_parameters"):
-                applied_rope_override = True
-
-        # A `rope_scaling` / `rope_parameters` dict override applied here (via
-        # `hf_overrides`) lands AFTER `get_config()` already ran
-        # `patch_rope_parameters`, which (on Transformers v4) is what migrates the
-        # legacy `rope_scaling` field into the modern `rope_parameters` dict that
-        # `_get_and_verify_max_len` reads to derive `max_model_len`. Without
-        # re-running the patch the override only updates the legacy `rope_scaling`
-        # attr while `rope_parameters` keeps the model's native (un-scaled) value,
-        # so e.g. a YaRN override is silently ignored and the engine derives the
-        # native context length instead of the extended one. Re-run the patch so
-        # the override propagates. Idempotent + version-safe: on Transformers v5
-        # the setattr already write-throughs to `rope_parameters` and the patch
-        # only standardizes/validates.
-        if applied_rope_override:
-            patch_rope_parameters(config)
-            text_config = getattr(config, "get_text_config", None)
-            if callable(text_config):
-                tc = text_config()
-                if tc is not config:
-                    patch_rope_parameters(tc)
 
     def __post_init__(
         self,
