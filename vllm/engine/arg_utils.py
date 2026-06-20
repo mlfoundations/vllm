@@ -1730,6 +1730,31 @@ class EngineArgs:
             import ray
 
             ray_runtime_env = ray.get_runtime_context().runtime_env
+            # Strip an inherited worker_process_setup_hook before this captured
+            # runtime_env is handed to vLLM's nested ray.init(). When an outer
+            # application (e.g. SkyRL) calls ray.init(runtime_env={"worker_process_setup_hook": ...}),
+            # get_runtime_context().runtime_env carries that hook PLUS the reserved
+            # env var __RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR. Passing it back into
+            # ray.init() makes connect() -> upload_worker_process_setup_hook_if_needed
+            # -> export_setup_func_module assert (reserved var already present), so
+            # every R3 ray-executor EngineCore dies at init. Dropping the top-level
+            # hook key makes upload_worker_process_setup_hook_if_needed early-return
+            # (the outer hook already ran in this process); also clear the reserved
+            # env var as belt-and-suspenders. The hook is NOT needed for vLLM's TP
+            # workers, which inherit the (already hook-applied) parent environment.
+            if ray_runtime_env is not None:
+                try:
+                    ray_runtime_env.pop("worker_process_setup_hook", None)
+                    _ev = ray_runtime_env.get("env_vars")
+                    if _ev and "__RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR" in _ev:
+                        _ev = dict(_ev)
+                        _ev.pop("__RAY_WORKER_PROCESS_SETUP_HOOK_ENV_VAR", None)
+                        ray_runtime_env["env_vars"] = _ev
+                except Exception:
+                    logger.warning(
+                        "Failed to strip worker_process_setup_hook from the "
+                        "inherited Ray runtime_env; nested ray.init may assert."
+                    )
             # Avoid logging sensitive environment variables
             sanitized_env = ray_runtime_env.to_dict() if ray_runtime_env else {}
             if "env_vars" in sanitized_env:
