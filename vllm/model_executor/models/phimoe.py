@@ -31,11 +31,14 @@ import torch
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
 
-from vllm.attention.layer import Attention
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from vllm.model_executor.layers.fused_moe import FusedMoE
+from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.fused_moe import (
+    FusedMoE,
+    fused_moe_make_expert_params_mapping,
+)
 from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
@@ -272,6 +275,7 @@ class PhiMoE(nn.Module):
             bias=False,
             params_dtype=params_dtype,
             quant_config=None,
+            prefix=f"{prefix}.gate",
         )
 
         self.experts = FusedMoE(
@@ -280,7 +284,6 @@ class PhiMoE(nn.Module):
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
             params_dtype=params_dtype,
-            reduce_results=True,
             renormalize=False,
             quant_config=quant_config,
             tp_size=tp_size,
@@ -352,7 +355,6 @@ class PhiMoEAttention(nn.Module):
         )
         self.rotary_emb = get_rope(
             self.head_dim,
-            rotary_dim=self.head_dim,
             max_position=max_position,
             rope_parameters=rope_parameters,
             is_neox_style=True,
@@ -483,7 +485,7 @@ class PhiMoEModel(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None,
         inputs_embeds: torch.Tensor | None = None,
@@ -515,7 +517,8 @@ class PhiMoEModel(nn.Module):
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
-        return FusedMoE.make_expert_params_mapping(
+        return fused_moe_make_expert_params_mapping(
+            self,
             ckpt_gate_proj_name="w1",
             ckpt_down_proj_name="w2",
             ckpt_up_proj_name="w3",
@@ -648,7 +651,7 @@ class PhiMoEForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,

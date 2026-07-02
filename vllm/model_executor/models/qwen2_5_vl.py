@@ -26,11 +26,12 @@
 # limitations under the License.
 """Inference-only Qwen2.5-VL model compatible with HuggingFace weights."""
 
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from functools import lru_cache, partial
 from typing import Annotated, Any, Literal, TypeAlias
 
 import einops
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -41,19 +42,16 @@ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLVisionConfig,
 )
 
-from vllm.attention.backends.registry import AttentionBackendEnum
-from vllm.attention.layer import maybe_get_vit_flash_attn_backend
-from vllm.attention.ops.vit_attn_wrappers import (
-    vit_flash_attn_wrapper,
-    vit_torch_sdpa_wrapper,
+from vllm.compilation.decorators import (
+    should_torch_compile_mm_encoder,
+    support_torch_compile,
 )
-from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import parallel_state
 from vllm.distributed import utils as dist_utils
-from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import get_act_and_mul_fn
+from vllm.model_executor.layers.attention import MMEncoderAttention
 from vllm.model_executor.layers.conv import Conv3dLayer
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
@@ -64,9 +62,11 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
+from vllm.model_executor.layers.rotary_embedding.common import (
+    ApplyRotaryEmb,
+)
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 from vllm.model_executor.models.module_mapping import MultiModelKeys
-from vllm.model_executor.models.vision import should_torch_compile_mm_vit
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.evs import (
     compute_mrope_for_media,
@@ -77,17 +77,21 @@ from vllm.multimodal.evs import (
 from vllm.multimodal.inputs import (
     MultiModalFeatureSpec,
     MultiModalFieldConfig,
-    MultiModalKwargs,
+    MultiModalKwargsItems,
 )
 from vllm.multimodal.parse import MultiModalDataItems
 from vllm.multimodal.processing import PromptReplacement, PromptUpdate
 from vllm.sequence import IntermediateTensors
 from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.utils.tensor_schema import TensorSchema, TensorShape
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
+from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphReplayBuffers
 
 from .interfaces import (
     MultiModalEmbeddings,
+    SupportsEagle,
     SupportsEagle3,
+    SupportsEncoderCudaGraph,
     SupportsLoRA,
     SupportsMRoPE,
     SupportsMultiModal,
@@ -99,7 +103,6 @@ from .qwen2_vl import Qwen2VLDummyInputsBuilder as Qwen2_5_VLDummyInputsBuilder
 from .qwen2_vl import (
     Qwen2VLMultiModalProcessor,
     Qwen2VLProcessingInfo,
-    apply_rotary_pos_emb_vision,
 )
 from .utils import (
     AutoWeightsLoader,
@@ -110,6 +113,7 @@ from .utils import (
 )
 from .vision import (
     get_vit_attn_backend,
+    is_vit_use_data_parallel,
     run_dp_sharded_mrope_vision_model,
 )
 
@@ -195,6 +199,8 @@ class Qwen2_5_VLVideoPixelInputs(TensorSchema):
         - second_per_grid_ts: The video time interval (in seconds) for each
           grid along the temporal dimension in the 3D position IDs. Returned
           when `videos` is not `None`.
+        - timestamps: List of timestamp values (in seconds) for each frame
+          after merging. Length equals the temporal dimension after merging.
     """
 
     type: Literal["pixel_values_videos"]
@@ -214,6 +220,8 @@ class Qwen2_5_VLVideoPixelInputs(TensorSchema):
         TensorShape("nv"),
     ]
 
+    timestamps: list[list[float]] | None = None
+
 
 class Qwen2_5_VLVideoEmbeddingInputs(TensorSchema):
     """
@@ -232,6 +240,8 @@ class Qwen2_5_VLVideoEmbeddingInputs(TensorSchema):
         - second_per_grid_ts: The video time interval (in seconds) for each
           grid along the temporal dimension in the 3D position IDs. Returned
           when `videos` is not `None`.
+        - timestamps: List of timestamp values (in seconds) for each frame
+          after merging. Length equals the temporal dimension after merging.
     """
 
     type: Literal["video_embeds"]
@@ -250,6 +260,7 @@ class Qwen2_5_VLVideoEmbeddingInputs(TensorSchema):
         torch.Tensor | None,
         TensorShape("nv"),
     ] = None
+    timestamps: list[list[float]] | None = None
 
 
 Qwen2_5_VLVideoInputs: TypeAlias = (
@@ -268,9 +279,9 @@ class Qwen2_5_VisionMLP(nn.Module):
         act_fn: Callable[[torch.Tensor], torch.Tensor] = F.silu,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        use_data_parallel: bool = False,
     ):
         super().__init__()
+        use_data_parallel = is_vit_use_data_parallel()
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=in_features,
             output_sizes=[hidden_features] * 2,  # [gate_proj, up_proj]
@@ -305,12 +316,10 @@ class Qwen2_5_VisionAttention(nn.Module):
         projection_size: int,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        use_data_parallel: bool = False,
-        attn_backend: AttentionBackendEnum = AttentionBackendEnum.TORCH_SDPA,
-        attn_backend_override: AttentionBackendEnum | None = None,
     ) -> None:
         super().__init__()
         # Per attention head and per partition values.
+        use_data_parallel = is_vit_use_data_parallel()
         self.tp_size = (
             1
             if use_data_parallel
@@ -342,18 +351,15 @@ class Qwen2_5_VisionAttention(nn.Module):
             prefix=f"{prefix}.proj",
             disable_tp=use_data_parallel,
         )
-        self.attn_backend = attn_backend
-        self.attn_backend, self.flash_attn_varlen_func = (
-            maybe_get_vit_flash_attn_backend(
-                self.attn_backend,
-                attn_backend_override=attn_backend_override,
-            )
+
+        self.attn = MMEncoderAttention(
+            num_heads=self.num_attention_heads_per_partition,
+            head_size=self.hidden_size_per_attention_head,
+            scale=self.hidden_size_per_attention_head**-0.5,
+            prefix=f"{prefix}.attn",
         )
 
-        self.is_flash_attn_backend = self.attn_backend in {
-            AttentionBackendEnum.FLASH_ATTN,
-            AttentionBackendEnum.ROCM_AITER_FA,
-        }
+        self.apply_rotary_emb = ApplyRotaryEmb(enforce_enable=True)
 
     def forward(
         self,
@@ -362,6 +368,7 @@ class Qwen2_5_VisionAttention(nn.Module):
         rotary_pos_emb_cos: torch.Tensor,
         rotary_pos_emb_sin: torch.Tensor,
         max_seqlen: torch.Tensor,  # Only used for Flash Attention
+        sequence_lengths: torch.Tensor,  # Only used for FlashInfer CuDNN backend
     ) -> torch.Tensor:
         # [s, b, c] --> [s, b, head * 3 * head_dim]
         x, _ = self.qkv(x)
@@ -380,8 +387,11 @@ class Qwen2_5_VisionAttention(nn.Module):
             qk_reshaped = einops.rearrange(
                 qk, "b s two head head_dim -> (two b) s head head_dim", two=2
             )
-            qk_rotated = apply_rotary_pos_emb_vision(
-                qk_reshaped, cos=rotary_pos_emb_cos, sin=rotary_pos_emb_sin
+            qk_reshaped = qk_reshaped.contiguous()
+            qk_rotated = self.apply_rotary_emb(
+                qk_reshaped,
+                rotary_pos_emb_cos,
+                rotary_pos_emb_sin,
             )
             qk_rotated = qk_rotated.view(
                 2,
@@ -394,32 +404,18 @@ class Qwen2_5_VisionAttention(nn.Module):
         else:
             q, k, v = qkv.unbind(dim=2)
 
-        if self.is_flash_attn_backend:
-            context_layer = vit_flash_attn_wrapper(
-                q,
-                k,
-                v,
-                cu_seqlens,
-                max_seqlen,
-                batch_size,
-                self.attn_backend == AttentionBackendEnum.ROCM_AITER_FA,
-            )
-        elif self.attn_backend == AttentionBackendEnum.TORCH_SDPA:
-            # Execute attention entry by entry for speed & less VRAM.
-            from vllm.platforms import current_platform
+        context_layer = self.attn(
+            query=q,
+            key=k,
+            value=v,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+            sequence_lengths=sequence_lengths,
+        )
 
-            # Never remove the next contiguous logic
-            # Without it, hallucinations occur with the backend
-            if current_platform.is_rocm():
-                q = q.contiguous()
-                k = k.contiguous()
-                v = v.contiguous()
-            context_layer = vit_torch_sdpa_wrapper(
-                q,
-                k,
-                v,
-                cu_seqlens,
-            )
+        context_layer = einops.rearrange(
+            context_layer, "b s h d -> s b (h d)", b=batch_size
+        ).contiguous()
 
         output, _ = self.proj(context_layer)
         return output
@@ -432,7 +428,8 @@ class Qwen2_5_VisionAttention(nn.Module):
         "rotary_pos_emb_cos": 0,
         "rotary_pos_emb_sin": 0,
     },
-    enable_if=should_torch_compile_mm_vit,
+    enable_if=should_torch_compile_mm_encoder,
+    is_encoder=True,
 )
 class Qwen2_5_VisionBlock(nn.Module):
     def __init__(
@@ -444,9 +441,6 @@ class Qwen2_5_VisionBlock(nn.Module):
         norm_layer: Callable[[int], nn.Module] | None = None,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        use_data_parallel: bool = False,
-        attn_backend: AttentionBackendEnum = AttentionBackendEnum.TORCH_SDPA,
-        attn_backend_override: AttentionBackendEnum | None = None,
     ) -> None:
         super().__init__()
         if norm_layer is None:
@@ -459,9 +453,6 @@ class Qwen2_5_VisionBlock(nn.Module):
             projection_size=dim,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
-            use_data_parallel=use_data_parallel,
-            attn_backend=attn_backend,
-            attn_backend_override=attn_backend_override,
         )
         self.mlp = Qwen2_5_VisionMLP(
             dim,
@@ -470,7 +461,6 @@ class Qwen2_5_VisionBlock(nn.Module):
             bias=True,
             quant_config=quant_config,
             prefix=f"{prefix}.mlp",
-            use_data_parallel=use_data_parallel,
         )
 
     def forward(
@@ -487,6 +477,7 @@ class Qwen2_5_VisionBlock(nn.Module):
             rotary_pos_emb_cos=rotary_pos_emb_cos,
             rotary_pos_emb_sin=rotary_pos_emb_sin,
             max_seqlen=max_seqlen,
+            sequence_lengths=None,
         )
         x_fused_norm, residual = self.norm2(x, residual=x_attn)
         x = residual + self.mlp(x_fused_norm)
@@ -497,7 +488,8 @@ class Qwen2_5_VisionBlock(nn.Module):
     dynamic_arg_dims={
         "x": 0,
     },
-    enable_if=should_torch_compile_mm_vit,
+    enable_if=should_torch_compile_mm_encoder,
+    is_encoder=True,
 )
 class Qwen2_5_VisionPatchEmbed(nn.Module):
     def __init__(
@@ -532,7 +524,8 @@ class Qwen2_5_VisionPatchEmbed(nn.Module):
     dynamic_arg_dims={
         "x": 0,
     },
-    enable_if=should_torch_compile_mm_vit,
+    enable_if=should_torch_compile_mm_encoder,
+    is_encoder=True,
 )
 class Qwen2_5_VisionPatchMerger(nn.Module):
     def __init__(
@@ -543,9 +536,9 @@ class Qwen2_5_VisionPatchMerger(nn.Module):
         spatial_merge_size: int = 2,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        use_data_parallel: bool = False,
     ) -> None:
         super().__init__()
+        use_data_parallel = is_vit_use_data_parallel()
         self.hidden_size = context_dim * (spatial_merge_size**2)
         if norm_layer is None:
             norm_layer = partial(nn.LayerNorm, eps=1e-6)
@@ -587,8 +580,6 @@ class Qwen2_5_VisionTransformer(nn.Module):
         norm_eps: float = 1e-6,
         quant_config: QuantizationConfig | None = None,
         prefix: str = "",
-        use_data_parallel: bool = False,
-        attn_backend_override: AttentionBackendEnum | None = None,
     ) -> None:
         super().__init__()
 
@@ -598,7 +589,6 @@ class Qwen2_5_VisionTransformer(nn.Module):
         depth = vision_config.depth
         self.hidden_size = vision_config.hidden_size
         self.num_heads = vision_config.num_heads
-        self.use_data_parallel = use_data_parallel
         self.out_hidden_size = vision_config.out_hidden_size
 
         # args for get_window_index_thw
@@ -607,79 +597,50 @@ class Qwen2_5_VisionTransformer(nn.Module):
         self.spatial_merge_size = vision_config.spatial_merge_size
         self.fullatt_block_indexes = vision_config.fullatt_block_indexes
         self.spatial_merge_unit = self.spatial_merge_size**2
-        # TODO[@lucaskabela]: Investigate fixing this usage
-        # see https://github.com/vllm-project/vllm/issues/27044
-        # DO NOT MOVE THIS IMPORT
-        from vllm.compilation.backends import set_model_tag
-
-        with set_model_tag("Qwen2_5_VisionPatchEmbed"):
-            self.patch_embed = Qwen2_5_VisionPatchEmbed(
-                patch_size=patch_size,
-                temporal_patch_size=temporal_patch_size,
-                in_channels=in_channels,
-                hidden_size=self.hidden_size,
-            )
+        self.patch_embed = Qwen2_5_VisionPatchEmbed(
+            patch_size=patch_size,
+            temporal_patch_size=temporal_patch_size,
+            in_channels=in_channels,
+            hidden_size=self.hidden_size,
+        )
 
         norm_layer = partial(RMSNorm, eps=norm_eps)
         head_dim = self.hidden_size // self.num_heads
         self.rotary_pos_emb = get_rope(
             head_size=head_dim,
-            rotary_dim=head_dim // 2,
             max_position=8192,
             is_neox_style=True,
+            rope_parameters={"partial_rotary_factor": 0.5},
         )
 
         self.attn_backend = get_vit_attn_backend(
             head_size=head_dim,
             dtype=torch.get_default_dtype(),
-            attn_backend_override=attn_backend_override,
         )
 
-        self.attn_backend, self.flash_attn_varlen_func = (
-            maybe_get_vit_flash_attn_backend(
-                self.attn_backend,
-                attn_backend_override=attn_backend_override,
-            )
+        self.blocks = nn.ModuleList(
+            [
+                Qwen2_5_VisionBlock(
+                    dim=self.hidden_size,
+                    num_heads=self.num_heads,
+                    mlp_hidden_dim=vision_config.intermediate_size,
+                    act_fn=get_act_and_mul_fn(vision_config.hidden_act),
+                    norm_layer=norm_layer,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.blocks.{layer_idx}",
+                )
+                for layer_idx in range(depth)
+            ]
         )
 
-        if self.attn_backend not in {
-            AttentionBackendEnum.FLASH_ATTN,
-            AttentionBackendEnum.TORCH_SDPA,
-            AttentionBackendEnum.ROCM_AITER_FA,
-        }:
-            raise RuntimeError(
-                f"Qwen2.5-VL does not support {self.attn_backend} backend now."
-            )
-
-        with set_model_tag("Qwen2_5_VisionBlock"):
-            self.blocks = nn.ModuleList(
-                [
-                    Qwen2_5_VisionBlock(
-                        dim=self.hidden_size,
-                        num_heads=self.num_heads,
-                        mlp_hidden_dim=vision_config.intermediate_size,
-                        act_fn=get_act_and_mul_fn(vision_config.hidden_act),
-                        norm_layer=norm_layer,
-                        quant_config=quant_config,
-                        prefix=f"{prefix}.blocks.{layer_idx}",
-                        use_data_parallel=use_data_parallel,
-                        attn_backend=self.attn_backend,
-                        attn_backend_override=attn_backend_override,
-                    )
-                    for layer_idx in range(depth)
-                ]
-            )
-
-        with set_model_tag("Qwen2_5_VisionPatchMerger"):
-            self.merger = Qwen2_5_VisionPatchMerger(
-                d_model=vision_config.out_hidden_size,
-                context_dim=self.hidden_size,
-                norm_layer=norm_layer,
-                spatial_merge_size=self.spatial_merge_size,
-                quant_config=quant_config,
-                prefix=f"{prefix}.merger",
-                use_data_parallel=use_data_parallel,
-            )
+        self.merger = Qwen2_5_VisionPatchMerger(
+            d_model=vision_config.out_hidden_size,
+            context_dim=self.hidden_size,
+            norm_layer=norm_layer,
+            spatial_merge_size=self.spatial_merge_size,
+            quant_config=quant_config,
+            prefix=f"{prefix}.merger",
+        )
 
     @property
     def dtype(self) -> torch.dtype:
@@ -800,6 +761,7 @@ class Qwen2_5_VisionTransformer(nn.Module):
         if self.attn_backend in {
             AttentionBackendEnum.FLASH_ATTN,
             AttentionBackendEnum.ROCM_AITER_FA,
+            AttentionBackendEnum.TRITON_ATTN,
         }:
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
         return max_seqlen
@@ -811,21 +773,53 @@ class Qwen2_5_VisionTransformer(nn.Module):
         inv[perm] = torch.arange(perm.numel(), device=perm.device, dtype=perm.dtype)
         return inv
 
-    def forward(
+    def prepare_encoder_metadata(
         self,
-        x: torch.Tensor,
         grid_thw: list[list[int]],
-    ) -> torch.Tensor:
+        *,
+        max_batch_size: int | None = None,
+        max_frames_per_batch: int | None = None,
+        max_window_seqs_per_batch: int | None = None,
+        max_seqlen_override: int | None = None,
+        max_seqlen_window_override: int | None = None,
+        device: torch.device | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Compute encoder metadata from grid_thw.
+
+        Shared by the eager forward path, CUDA graph capture, and
+        CUDA graph replay to avoid duplicated implementation.
+
+        Args:
+            grid_thw: Grid configurations as list of [t, h, w].
+            max_batch_size: If set, pad cu_seqlens to this size
+                (needed for CUDA graph capture/replay).
+            max_frames_per_batch: If set, overrides max_batch_size for
+                cu_seqlens padding. For video inputs each item contributes
+                T attention sequences (frames); this sizes the buffer to
+                the total frame budget so video replays never overflow.
+            max_window_seqs_per_batch: If set, pad cu_window_seqlens to this
+                number of window sequences. This keeps cu_window_seqlens shape
+                stable across capture/replay for CUDA graph safety.
+            max_seqlen_override: If set, use this value for max_seqlen
+                instead of computing from cu_seqlens (needed for CUDA
+                graph capture to cover worst-case replay scenarios).
+            max_seqlen_window_override: If set, use this value for
+                window-attention max_seqlen instead of computing from
+                cu_window_seqlens (needed for CUDA graph capture to
+                cover worst-case replay scenarios).
+            device: Device to place tensors on. Defaults to self.device.
+        """
+
+        if device is None:
+            device = self.device
+        metadata: dict[str, torch.Tensor] = {}
+
         # patchify
-        seq_len, _ = x.size()
         rotary_pos_emb_cos = []
         rotary_pos_emb_sin = []
         window_index: list = []
         cu_window_seqlens: list = [torch.tensor([0], dtype=torch.int32)]
         cu_seqlens: list = []
-
-        hidden_states = x.to(device=self.device, dtype=self.dtype)
-        hidden_states = self.patch_embed(hidden_states)
 
         window_index_id = 0
         cu_window_seqlens_last = 0
@@ -865,23 +859,99 @@ class Qwen2_5_VisionTransformer(nn.Module):
         cu_seqlens = torch.cumsum(cu_seqlens, dim=0, dtype=torch.int32)
         cu_seqlens = F.pad(cu_seqlens, (1, 0), "constant", 0)
 
+        # Pad cu_seqlens to the required number of sequences.
+        # For videos each item contributes T frames = T attention sequences,
+        # so the total can exceed max_batch_size. max_frames_per_batch
+        # overrides the pad target when set.
+        pad_to = (
+            max_frames_per_batch if max_frames_per_batch is not None else max_batch_size
+        )
+        if pad_to is not None:
+            num_seqs = len(cu_seqlens) - 1
+            if num_seqs < pad_to:
+                cu_seqlens = torch.cat(
+                    (
+                        cu_seqlens,
+                        torch.full(
+                            (pad_to - num_seqs,),
+                            cu_seqlens[-1],
+                            dtype=cu_seqlens.dtype,
+                            device=cu_seqlens.device,
+                        ),
+                    )
+                )
+
+        # Pad cu_window_seqlens to a stable number of window sequences.
+        # Like cu_seqlens, we repeat the last cumulative offset so padded
+        # entries represent empty sequences.
+        if max_window_seqs_per_batch is not None:
+            num_window_seqs = len(cu_window_seqlens) - 1
+            if num_window_seqs < max_window_seqs_per_batch:
+                cu_window_seqlens = torch.cat(
+                    (
+                        cu_window_seqlens,
+                        torch.full(
+                            (max_window_seqs_per_batch - num_window_seqs,),
+                            cu_window_seqlens[-1],
+                            dtype=cu_window_seqlens.dtype,
+                            device=cu_window_seqlens.device,
+                        ),
+                    )
+                )
+
         # transformers
         # pre-compute seqlens for window/full attn to reduce cuMemcpy operations
-        max_seqlen_full = self.compute_attn_mask_seqlen(cu_seqlens)
-        max_seqlen_window = self.compute_attn_mask_seqlen(cu_window_seqlens)
+        if max_seqlen_override is None:
+            max_seqlen_full = self.compute_attn_mask_seqlen(cu_seqlens)
+        else:
+            max_seqlen_full = torch.tensor(max_seqlen_override, dtype=torch.int32)
+        if max_seqlen_window_override is None:
+            max_seqlen_window = self.compute_attn_mask_seqlen(cu_window_seqlens)
+        else:
+            max_seqlen_window = torch.tensor(
+                max_seqlen_window_override, dtype=torch.int32
+            )
 
-        cu_seqlens = cu_seqlens.to(device=self.device, non_blocking=True)
-        cu_window_seqlens = cu_window_seqlens.to(device=self.device, non_blocking=True)
-        rotary_pos_emb_cos = rotary_pos_emb_cos.to(
-            device=self.device, non_blocking=True
-        )
-        rotary_pos_emb_sin = rotary_pos_emb_sin.to(
-            device=self.device, non_blocking=True
-        )
-        window_index = window_index.to(device=hidden_states.device, non_blocking=True)
-        reverse_indices = reverse_indices.to(
-            device=hidden_states.device, non_blocking=True
-        )
+        cu_seqlens = cu_seqlens.to(device=device, non_blocking=True)
+        cu_window_seqlens = cu_window_seqlens.to(device=device, non_blocking=True)
+        rotary_pos_emb_cos = rotary_pos_emb_cos.to(device=device, non_blocking=True)
+        rotary_pos_emb_sin = rotary_pos_emb_sin.to(device=device, non_blocking=True)
+        window_index = window_index.to(device=device, non_blocking=True)
+        reverse_indices = reverse_indices.to(device=device, non_blocking=True)
+
+        metadata["rotary_pos_emb_cos"] = rotary_pos_emb_cos
+        metadata["rotary_pos_emb_sin"] = rotary_pos_emb_sin
+        metadata["window_index"] = window_index
+        metadata["reverse_indices"] = reverse_indices
+        metadata["cu_seqlens"] = cu_seqlens
+        metadata["cu_window_seqlens"] = cu_window_seqlens
+        metadata["max_seqlen_full"] = max_seqlen_full
+        metadata["max_seqlen_window"] = max_seqlen_window
+
+        return metadata
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        grid_thw: list[list[int]],
+        *,
+        encoder_metadata: dict[str, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        hidden_states = x.to(device=self.device, dtype=self.dtype)
+        hidden_states = self.patch_embed(hidden_states)
+
+        seq_len = hidden_states.shape[0]
+        if encoder_metadata is None:
+            encoder_metadata = self.prepare_encoder_metadata(grid_thw)
+
+        rotary_pos_emb_cos = encoder_metadata["rotary_pos_emb_cos"]
+        rotary_pos_emb_sin = encoder_metadata["rotary_pos_emb_sin"]
+        window_index = encoder_metadata["window_index"]
+        reverse_indices = encoder_metadata["reverse_indices"]
+        cu_seqlens = encoder_metadata["cu_seqlens"]
+        cu_window_seqlens = encoder_metadata["cu_window_seqlens"]
+        max_seqlen_full = encoder_metadata["max_seqlen_full"]
+        max_seqlen_window = encoder_metadata["max_seqlen_window"]
 
         hidden_states = hidden_states.reshape(
             seq_len // self.spatial_merge_unit, self.spatial_merge_unit, -1
@@ -969,11 +1039,22 @@ class Qwen2_5_VLMultiModalProcessor(Qwen2VLMultiModalProcessor):
             second_per_grid_ts=MultiModalFieldConfig.batched("video"),
         )
 
+    def _call_hf_processor(
+        self,
+        prompt: str,
+        mm_data: Mapping[str, object],
+        mm_kwargs: Mapping[str, object],
+        tok_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        # Override to use the text path instead of token path to use the
+        # video-specific logic in processing_qwen2_5_vl.py
+        return super()._call_hf_processor(prompt, mm_data, mm_kwargs, tok_kwargs)
+
     def _get_prompt_updates(
         self,
         mm_items: MultiModalDataItems,
         hf_processor_mm_kwargs: Mapping[str, Any],
-        out_mm_kwargs: MultiModalKwargs,
+        out_mm_kwargs: MultiModalKwargsItems,
     ) -> Sequence[PromptUpdate]:
         hf_processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
         image_processor = self.info.get_image_processor(**hf_processor_mm_kwargs)
@@ -1032,19 +1113,19 @@ class Qwen2_5_VLMultiModalProcessor(Qwen2VLMultiModalProcessor):
 class Qwen2_5_VLForConditionalGeneration(
     nn.Module,
     SupportsMultiModal,
+    SupportsEncoderCudaGraph,
     SupportsLoRA,
     SupportsPP,
     SupportsQuant,
+    SupportsEagle,
     SupportsEagle3,
     SupportsMultiModalPruning,
     SupportsMRoPE,
 ):
-    merge_by_field_config = True
-    multimodal_cpu_fields = {"image_grid_thw", "video_grid_thw"}
-
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
         "gate_up_proj": ["gate_proj", "up_proj"],
+        "qkv": ["qkv"],  # For vision tower's already-packed QKV
     }
 
     # To ensure correct weight loading and mapping.
@@ -1061,121 +1142,82 @@ class Qwen2_5_VLForConditionalGeneration(
 
     supports_encoder_tp_data = True
 
+    def iter_mm_grid_thw(
+        self, mm_features: list[MultiModalFeatureSpec]
+    ) -> Iterator[tuple[int, int, int, int, float]]:
+        """
+        Iterate over multimodal features and yield grid information.
+
+        Args:
+            mm_features: List of multimodal feature specifications
+
+        Yields:
+            Tuple of (offset, grid_t, grid_h, grid_w, t_factor) for each frame/image
+        """
+        spatial_merge_size = self.config.vision_config.spatial_merge_size
+        tokens_per_second = getattr(self.config.vision_config, "tokens_per_second", 1.0)
+        for mm_feature in sorted(mm_features, key=lambda f: f.mm_position.offset):
+            offset = mm_feature.mm_position.offset
+            if mm_feature.modality == "image":
+                t, h, w = mm_feature.data["image_grid_thw"].data.tolist()
+                assert t == 1, f"Image must have 1 frame, got {t}"
+                yield offset, 1, h // spatial_merge_size, w // spatial_merge_size, 1.0
+            elif mm_feature.modality == "video":
+                t, h, w = mm_feature.data["video_grid_thw"].data.tolist()
+                second_per_grid_ts = 1.0
+                if mm_feature.data.get("second_per_grid_ts", None):
+                    second_per_grid_ts = mm_feature.data[
+                        "second_per_grid_ts"
+                    ].data.item()
+                t_factor = second_per_grid_ts * tokens_per_second
+                yield (
+                    offset,
+                    t,
+                    h // spatial_merge_size,
+                    w // spatial_merge_size,
+                    t_factor,
+                )
+            else:
+                raise ValueError(f"Unsupported modality: {mm_feature.modality}")
+
     def get_mrope_input_positions(
         self,
         input_tokens: list[int],
         mm_features: list[MultiModalFeatureSpec],
     ) -> tuple[torch.Tensor, int]:
-        kwargs = MultiModalFeatureSpec.gather_kwargs(
-            mm_features,
-            {"image_grid_thw", "video_grid_thw", "second_per_grid_ts"},
-        )
-        image_grid_thw = [item.tolist() for item in kwargs.get("image_grid_thw", [])]
-        video_grid_thw = [item.tolist() for item in kwargs.get("video_grid_thw", [])]
-        second_per_grid_ts = kwargs.get("second_per_grid_ts", [])
-
-        hf_config = self.config
-        image_token_id = hf_config.image_token_id
-        video_token_id = hf_config.video_token_id
-        vision_start_token_id = hf_config.vision_start_token_id
-        spatial_merge_size = hf_config.vision_config.spatial_merge_size
-        tokens_per_second = getattr(hf_config.vision_config, "tokens_per_second", 1.0)
-
-        input_tokens_tensor = torch.tensor(input_tokens)
-        vision_start_indices = torch.argwhere(
-            input_tokens_tensor == vision_start_token_id
-        ).squeeze(1)
-        vision_tokens = input_tokens_tensor[vision_start_indices + 1]
-        image_nums = (vision_tokens == image_token_id).sum()
-        video_nums = (vision_tokens == video_token_id).sum()
         llm_pos_ids_list: list = []
-
         st = 0
-        remain_images, remain_videos = image_nums, video_nums
 
-        image_index, video_index = 0, 0
-        for _ in range(image_nums + video_nums):
-            video_second_per_grid_t = 0.0
-            if remain_images > 0:
-                try:
-                    ed_image = input_tokens.index(image_token_id, st)
-                except ValueError:
-                    ed_image = len(input_tokens) + 1
-            else:
-                ed_image = len(input_tokens) + 1
-            if remain_videos > 0:
-                try:
-                    ed_video = input_tokens.index(video_token_id, st)
-                except ValueError:
-                    ed_video = len(input_tokens) + 1
-            else:
-                ed_video = len(input_tokens) + 1
-            if ed_image < ed_video:
-                t, h, w = image_grid_thw[image_index]
-                image_index += 1
-                remain_images -= 1
-                ed = ed_image
-            else:
-                t, h, w = video_grid_thw[video_index]
-                video_second_per_grid_t = 1.0
-                if second_per_grid_ts:
-                    video_second_per_grid_t = second_per_grid_ts[video_index]
-                video_index += 1
-                remain_videos -= 1
-                ed = ed_video
-
-            llm_grid_t, llm_grid_h, llm_grid_w = (
-                t,
-                h // spatial_merge_size,
-                w // spatial_merge_size,
-            )
-            text_len = ed - st
-
+        for (
+            offset,
+            llm_grid_t,
+            llm_grid_h,
+            llm_grid_w,
+            t_factor,
+        ) in self.iter_mm_grid_thw(mm_features):
+            text_len = offset - st
             st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
             llm_pos_ids_list.append(
-                torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
+                np.broadcast_to(np.arange(text_len), (3, text_len)) + st_idx
             )
 
-            t_index = (
-                (
-                    torch.arange(llm_grid_t)
-                    .view(-1, 1)
-                    .expand(-1, llm_grid_h * llm_grid_w)
-                    * video_second_per_grid_t
-                    * tokens_per_second
-                )
-                .long()
-                .flatten()
-            )
-
-            h_index = (
-                torch.arange(llm_grid_h)
-                .view(1, -1, 1)
-                .expand(llm_grid_t, -1, llm_grid_w)
-                .flatten()
-            )
-            w_index = (
-                torch.arange(llm_grid_w)
-                .view(1, 1, -1)
-                .expand(llm_grid_t, llm_grid_h, -1)
-                .flatten()
-            )
-            llm_pos_ids_list.append(
-                torch.stack([t_index, h_index, w_index]) + text_len + st_idx
-            )
-            st = ed + llm_grid_t * llm_grid_h * llm_grid_w
+            grid_indices = np.indices((llm_grid_t, llm_grid_h, llm_grid_w))
+            if t_factor != 1.0:
+                grid_indices[0] = (grid_indices[0] * t_factor).astype(np.int64)
+            llm_pos_ids_list.append(grid_indices.reshape(3, -1) + text_len + st_idx)
+            st = offset + llm_grid_t * llm_grid_h * llm_grid_w
 
         if st < len(input_tokens):
             st_idx = llm_pos_ids_list[-1].max() + 1 if len(llm_pos_ids_list) > 0 else 0
             text_len = len(input_tokens) - st
             llm_pos_ids_list.append(
-                torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
+                np.broadcast_to(np.arange(text_len), (3, text_len)) + st_idx
             )
 
-        llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+        llm_positions = np.concatenate(llm_pos_ids_list, axis=1).reshape(3, -1)
         mrope_position_delta = (llm_positions.max() + 1 - len(input_tokens)).item()
 
-        return llm_positions, mrope_position_delta
+        return torch.from_numpy(llm_positions), mrope_position_delta
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -1193,6 +1235,7 @@ class Qwen2_5_VLForConditionalGeneration(
 
         self.use_data_parallel = multimodal_config.mm_encoder_tp_mode == "data"
         self.config = config
+        self.model_config = vllm_config.model_config
         self.vllm_config = vllm_config
         self.multimodal_config = multimodal_config
         self.video_pruning_rate = multimodal_config.video_pruning_rate
@@ -1200,41 +1243,24 @@ class Qwen2_5_VLForConditionalGeneration(
             multimodal_config.is_multimodal_pruning_enabled()
         )
 
-        if multimodal_config.get_limit_per_prompt(
-            "image"
-        ) or multimodal_config.get_limit_per_prompt("video"):
-            attn_backend_override = (
-                multimodal_config.mm_encoder_attn_backend
-                if multimodal_config is not None
-                else None
-            )
+        with self._mark_tower_model(vllm_config, {"image", "video"}):
             self.visual = Qwen2_5_VisionTransformer(
                 vision_config=config.vision_config,
                 norm_eps=getattr(config, "rms_norm_eps", 1e-6),
                 quant_config=self.quant_config,
                 prefix=maybe_prefix(prefix, "visual"),
-                use_data_parallel=self.use_data_parallel,
-                attn_backend_override=attn_backend_override,
             )
-        else:
-            self.visual = None
 
-        self.language_model = init_vllm_registered_model(
-            vllm_config=vllm_config,
-            prefix=maybe_prefix(prefix, "language_model"),
-            architectures=["Qwen2ForCausalLM"],
-        )
+        with self._mark_language_model(vllm_config):
+            self.language_model = init_vllm_registered_model(
+                vllm_config=vllm_config,
+                prefix=maybe_prefix(prefix, "language_model"),
+                architectures=["Qwen2ForCausalLM"],
+            )
 
         self.make_empty_intermediate_tensors = (
             self.language_model.make_empty_intermediate_tensors
         )
-
-    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
-        self.language_model.model.aux_hidden_state_layers = layers
-
-    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
-        num_layers = len(self.language_model.model.layers)
-        return (2, num_layers // 2, num_layers - 3)
 
     def _parse_and_validate_image_input(
         self, **kwargs: object
@@ -1298,13 +1324,12 @@ class Qwen2_5_VLForConditionalGeneration(
             image_embeds = image_input["image_embeds"].type(self.visual.dtype)
         else:
             pixel_values = image_input["pixel_values"]
-            with set_forward_context(None, self.vllm_config):
-                if self.use_data_parallel:
-                    return run_dp_sharded_mrope_vision_model(
-                        self.visual, pixel_values, grid_thw_list, rope_type="rope_3d"
-                    )
-                else:
-                    image_embeds = self.visual(pixel_values, grid_thw=grid_thw_list)
+            if self.use_data_parallel:
+                return run_dp_sharded_mrope_vision_model(
+                    self.visual, pixel_values, grid_thw_list, rope_type="rope_3d"
+                )
+            else:
+                image_embeds = self.visual(pixel_values, grid_thw=grid_thw_list)
 
         # Split concatenated embeddings for each image item.
         merge_size = self.visual.spatial_merge_size
@@ -1353,18 +1378,15 @@ class Qwen2_5_VLForConditionalGeneration(
             video_embeds = video_input["video_embeds"].type(self.visual.dtype)
         else:
             pixel_values_videos = video_input["pixel_values_videos"]
-            with set_forward_context(None, self.vllm_config):
-                if self.use_data_parallel:
-                    return run_dp_sharded_mrope_vision_model(
-                        self.visual,
-                        pixel_values_videos,
-                        grid_thw_list,
-                        rope_type="rope_3d",
-                    )
-                else:
-                    video_embeds = self.visual(
-                        pixel_values_videos, grid_thw=grid_thw_list
-                    )
+            if self.use_data_parallel:
+                return run_dp_sharded_mrope_vision_model(
+                    self.visual,
+                    pixel_values_videos,
+                    grid_thw_list,
+                    rope_type="rope_3d",
+                )
+            else:
+                video_embeds = self.visual(pixel_values_videos, grid_thw=grid_thw_list)
 
         # Split concatenated embeddings for each video item.
         merge_size = self.visual.spatial_merge_size
@@ -1508,9 +1530,6 @@ class Qwen2_5_VLForConditionalGeneration(
                 )
         return mm_input_by_modality
 
-    def get_language_model(self) -> torch.nn.Module:
-        return self.language_model
-
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         mm_input_by_modality = self._parse_and_validate_multimodal_inputs(**kwargs)
         if not mm_input_by_modality:
@@ -1540,9 +1559,305 @@ class Qwen2_5_VLForConditionalGeneration(
                 multimodal_embeddings += tuple(video_embeddings)
         return multimodal_embeddings
 
+    # -- SupportsEncoderCudaGraph protocol methods --
+
+    def get_encoder_cudagraph_config(self):
+        from vllm.v1.worker.encoder_cudagraph_defs import (
+            EncoderCudaGraphConfig,
+        )
+
+        # NOTE: With EVS pruning enabled, multimodal embeddings are post-processed
+        # (append positions for image and prune+append positions for video) in
+        # embed_multimodal(). The encoder CUDA graph path bypasses that postprocess
+        # hook, so disable CUDA graph for all modalities to avoid inconsistent
+        # embedding formats between eager and cudagraph paths.
+        modalities = [] if self.is_multimodal_pruning_enabled else ["image", "video"]
+
+        return EncoderCudaGraphConfig(
+            modalities=modalities,
+            input_key_by_modality={
+                "image": "pixel_values",
+                "video": "pixel_values_videos",
+            },
+            buffer_keys=[
+                "rotary_pos_emb_cos",
+                "rotary_pos_emb_sin",
+                "window_index",
+                "reverse_indices",
+                "cu_seqlens",
+                "cu_window_seqlens",
+                "max_seqlen_full",
+                "max_seqlen_window",
+            ],
+            out_hidden_size=self.visual.out_hidden_size,
+        )
+
+    def get_input_modality(
+        self,
+        mm_kwargs: dict[str, Any],
+    ) -> str:
+        if "image_grid_thw" in mm_kwargs:
+            return "image"
+        return "video"
+
+    def get_max_frames_per_video(self) -> int:
+        mm_registry = MULTIMODAL_REGISTRY
+        info = mm_registry.get_processing_info(self.model_config)
+        max_frames_per_video = info.get_num_frames_with_most_features(
+            seq_len=self.model_config.max_model_len,
+            mm_counts={"video": self.multimodal_config.get_limit_per_prompt("video")},
+        )
+        return max_frames_per_video
+
+    def get_encoder_cudagraph_budget_range(
+        self,
+        vllm_config: VllmConfig,
+    ) -> tuple[int, int]:
+        # Min: estimated smallest possible encoder input.
+        # 224x224 image → 16x16 patches (patch_size=14)
+        #                 spatial_merge_size=2 → 8x8 = 64 tokens
+        min_budget = 64
+        # Max: capped by max_num_batched_tokens
+        max_budget = min(
+            vllm_config.scheduler_config.max_num_batched_tokens,
+            self.model_config.max_model_len,
+        )
+        return (min_budget, max_budget)
+
+    def _get_pixel_values_by_modality(
+        self,
+        mm_kwargs: dict[str, Any],
+    ) -> torch.Tensor:
+        if self.get_input_modality(mm_kwargs) == "image":
+            pixel_values = mm_kwargs["pixel_values"]
+        else:
+            pixel_values = mm_kwargs["pixel_values_videos"]
+        return pixel_values
+
+    def _get_grid_thw_by_modality(
+        self,
+        mm_kwargs: dict[str, Any],
+    ) -> list[tuple[int, int, int]]:
+        grid_thw_key = f"{self.get_input_modality(mm_kwargs)}_grid_thw"
+        grid_thw = mm_kwargs[grid_thw_key]
+        if not isinstance(grid_thw, list):
+            grid_thw = grid_thw.tolist()
+        return grid_thw
+
+    def get_encoder_cudagraph_num_items(
+        self,
+        mm_kwargs: dict[str, Any],
+    ) -> int:
+        return len(self._get_grid_thw_by_modality(mm_kwargs))
+
+    def get_encoder_cudagraph_per_item_output_tokens(
+        self,
+        mm_kwargs: dict[str, Any],
+    ) -> list[int]:
+        m = self.visual.spatial_merge_size
+        grid_thw = self._get_grid_thw_by_modality(mm_kwargs)
+        return [t * (h // m) * (w // m) for t, h, w in grid_thw]
+
+    def get_encoder_cudagraph_per_item_input_sizes(
+        self,
+        mm_kwargs: dict[str, Any],
+    ) -> list[int]:
+        grid_thw = self._get_grid_thw_by_modality(mm_kwargs)
+        return [t * h * w for t, h, w in grid_thw]
+
+    def select_encoder_cudagraph_items(
+        self,
+        mm_kwargs: dict[str, Any],
+        indices: list[int],
+    ) -> dict[str, Any]:
+        grid_thw = self._get_grid_thw_by_modality(mm_kwargs)
+        pixel_values = self._get_pixel_values_by_modality(mm_kwargs)
+
+        if len(indices) == 0:
+            if self.get_input_modality(mm_kwargs) == "image":
+                return {
+                    "pixel_values": pixel_values[:0],
+                    "image_grid_thw": [],
+                }
+            else:
+                return {
+                    "pixel_values_videos": pixel_values[:0],
+                    "video_grid_thw": [],
+                }
+
+        # Compute cumulative patch offsets for slicing pixel_values
+        patches_per_item = [t * h * w for t, h, w in grid_thw]
+        cum_patches = [0]
+        for p in patches_per_item:
+            cum_patches.append(cum_patches[-1] + p)
+
+        selected_pv = torch.cat(
+            [pixel_values[cum_patches[i] : cum_patches[i + 1]] for i in indices]
+        )
+        selected_grid = [grid_thw[i] for i in indices]
+
+        if self.get_input_modality(mm_kwargs) == "image":
+            return {
+                "pixel_values": selected_pv,
+                "image_grid_thw": selected_grid,
+            }
+        else:
+            return {
+                "pixel_values_videos": selected_pv,
+                "video_grid_thw": selected_grid,
+            }
+
+    def prepare_encoder_cudagraph_capture_inputs(
+        self,
+        token_budget: int,
+        max_batch_size: int,
+        max_frames_per_batch: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ):
+        from vllm.v1.worker.encoder_cudagraph_defs import (
+            EncoderCudaGraphCaptureInputs,
+        )
+
+        spatial_merge_size = self.visual.spatial_merge_size
+        max_window_seqs_per_batch = min(
+            self.vllm_config.scheduler_config.max_num_batched_tokens,
+            self.model_config.max_model_len,
+        )
+        # Use ceil here (not floor) so total captured capacity is never smaller
+        # than token_budget when token_budget is not divisible by max_batch_size
+        # (e.g., 324 budget with max_batch_size=8). Floor under-allocates
+        # input_buffer and can fail replay copy for valid single-item batches.
+        per_mm_item_output = (token_budget + max_batch_size - 1) // max_batch_size
+
+        frames_per_item = max_frames_per_batch // max_batch_size
+        if frames_per_item > 1:
+            # Build the capture grid using a video-format layout so that
+            # cu_seqlens is sized for video replays from the start.
+            # cu_seqlens has one entry per attention sequence (one per frame),
+            # so using T > 1 per item makes the buffer large enough without
+            # relying solely on padding.
+            # Ceiling ensures frames_per_item * tokens_per_frame >= per_mm_item_output
+            # so the pixel_values buffer covers any valid single-item replay.
+            tokens_per_frame = (
+                per_mm_item_output + frames_per_item - 1
+            ) // frames_per_item
+            # Video-format grid_config (T=frames_per_item).
+            grid_config = [
+                [
+                    frames_per_item,
+                    spatial_merge_size,
+                    tokens_per_frame * spatial_merge_size,
+                ]
+                for _ in range(max_batch_size)
+            ]
+        else:
+            # Image-format grid_config (T=1).
+            grid_config = [
+                [1, spatial_merge_size, per_mm_item_output * spatial_merge_size]
+                for _ in range(max_batch_size)
+            ]
+
+        # Create dummy pixel_values
+        patch_embed = self.visual.patch_embed
+        in_channels = patch_embed.proj.in_channels
+        patch_size = patch_embed.patch_size
+        temporal_patch_size = patch_embed.temporal_patch_size
+        total_patches = sum(t * h * w for t, h, w in grid_config)
+        flattened_patch_size = (
+            in_channels * temporal_patch_size * patch_size * patch_size
+        )
+        dummy_pixel_values = torch.randn(
+            total_patches, flattened_patch_size, device=device, dtype=dtype
+        )
+
+        # Override max_seqlen with a safe upper bound for capture.
+        # max_seqlen.item() gets baked into the CUDA graph (not replayed),
+        # so the capture value must cover any replay scenario.
+        # Worst case: 1 item consuming the full budget ->
+        # seq_len = token_budget * spatial_merge_size^2.
+        # For window-attention, each local window is bounded by fixed geometry:
+        # (window_size / patch_size / spatial_merge_size)^2 windows in merged
+        # token space, multiplied by spatial_merge_size^2 to map back to the
+        # unmerged sequence length used by attention kernels.
+        vit_merger_window_size = (
+            self.visual.window_size
+            // self.visual.spatial_merge_size
+            // self.visual.patch_size
+        )
+        max_seqlen_window_override = vit_merger_window_size**2 * (spatial_merge_size**2)
+        buffers = self.visual.prepare_encoder_metadata(
+            grid_config,
+            max_batch_size=max_batch_size,
+            max_frames_per_batch=max_frames_per_batch,
+            max_window_seqs_per_batch=max_window_seqs_per_batch,
+            max_seqlen_override=token_budget * (spatial_merge_size**2),
+            max_seqlen_window_override=max_seqlen_window_override,
+            device=device,
+        )
+
+        # Just use image-modality dummy input_buffer for capturing, since it's also
+        # compatible for video inputs (has the same shape: [num_patches, C*T*P*P]).
+        mm_kwargs = {
+            "pixel_values": dummy_pixel_values,
+            "image_grid_thw": grid_config,
+        }
+
+        return EncoderCudaGraphCaptureInputs(
+            mm_kwargs=mm_kwargs,
+            buffers=buffers,
+        )
+
+    def prepare_encoder_cudagraph_replay_buffers(
+        self,
+        mm_kwargs: dict[str, Any],
+        max_batch_size: int,
+        max_frames_per_batch: int,
+    ):
+        modality = self.get_input_modality(mm_kwargs)
+        grid_thw_list = self._get_grid_thw_by_modality(mm_kwargs)
+
+        if modality == "image":
+            buffers = self.visual.prepare_encoder_metadata(
+                grid_thw_list,
+                max_batch_size=max_batch_size,
+                max_window_seqs_per_batch=min(
+                    self.vllm_config.scheduler_config.max_num_batched_tokens,
+                    self.model_config.max_model_len,
+                ),
+            )
+        else:
+            buffers = self.visual.prepare_encoder_metadata(
+                grid_thw_list,
+                max_frames_per_batch=max_frames_per_batch,
+                max_window_seqs_per_batch=min(
+                    self.vllm_config.scheduler_config.max_num_batched_tokens,
+                    self.model_config.max_model_len,
+                ),
+            )
+
+        return EncoderCudaGraphReplayBuffers(buffers=buffers)
+
+    def encoder_cudagraph_forward(
+        self,
+        mm_kwargs: dict[str, Any],
+        buffers: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        pixel_values = self._get_pixel_values_by_modality(mm_kwargs)
+        grid_thw = self._get_grid_thw_by_modality(mm_kwargs)
+        return self.visual(pixel_values, grid_thw, encoder_metadata=buffers)
+
+    def encoder_eager_forward(
+        self,
+        mm_kwargs: dict[str, Any],
+    ) -> torch.Tensor:
+        pixel_values = self._get_pixel_values_by_modality(mm_kwargs)
+        grid_thw = self._get_grid_thw_by_modality(mm_kwargs)
+        return self.visual(pixel_values, grid_thw)
+
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -1577,10 +1892,7 @@ class Qwen2_5_VLForConditionalGeneration(
         return self.language_model.compute_logits(hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        skip_prefixes = []
-        if self.visual is None:
-            skip_prefixes.extend(["visual."])
-        loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
+        loader = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def get_mm_mapping(self) -> MultiModelKeys:
@@ -1592,3 +1904,22 @@ class Qwen2_5_VLForConditionalGeneration(
             connector="visual.merger.",
             tower_model="visual.",
         )
+
+    def get_num_mm_encoder_tokens(
+        self,
+        num_image_tokens: int,
+    ) -> int:
+        hf_config = self.config
+        vision_config = hf_config.vision_config
+        merge_size = vision_config.spatial_merge_size
+
+        return num_image_tokens * merge_size**2
+
+    def get_num_mm_connector_tokens(
+        self,
+        num_vision_tokens: int,
+    ) -> int:
+        hf_config = self.config
+        vision_config = hf_config.vision_config
+        merge_size = vision_config.spatial_merge_size
+        return num_vision_tokens // merge_size**2

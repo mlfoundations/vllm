@@ -7,7 +7,6 @@ from prometheus_client import Counter, Gauge, Histogram
 
 from vllm.config import KVTransferConfig, VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
-from vllm.distributed.kv_transfer.kv_transfer_state import has_kv_transfer_group
 from vllm.logger import init_logger
 
 PromMetric: TypeAlias = Gauge | Counter | Histogram
@@ -53,8 +52,6 @@ class KVConnectorStats:
 
 class KVConnectorLogging:
     def __init__(self, kv_transfer_config: KVTransferConfig | None):
-        # This should be called on frontend process.
-        assert not has_kv_transfer_group()
         # Instantiate the connector's stats class.
         if kv_transfer_config and kv_transfer_config.kv_connector:
             self.connector_cls = KVConnectorFactory.get_connector_class(
@@ -127,30 +124,19 @@ class KVConnectorPromMetrics:
         self._counter_cls = metric_types[Counter]
         self._histogram_cls = metric_types[Histogram]
         self._labelnames = labelnames
-        self._per_engine_labelvalues = per_engine_labelvalues
-
-    def make_per_engine(self, metric: PromMetric) -> dict[int, PromMetric]:
-        """
-        Create a per-engine child of a prometheus_client.Metric with
-        the appropriate labels set. The parent metric must be created
-        using the labelnames list.
-        """
-        return {
-            idx: metric.labels(*labelvalues)
-            for idx, labelvalues in self._per_engine_labelvalues.items()
-        }
+        self.per_engine_labelvalues = per_engine_labelvalues
 
     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
         """
         Record the supplied transfer statistics to Prometheus metrics. These
         statistics are engine-specific, and should be recorded to a metric
         with the appropriate 'engine' label. These metric instances can be
-        created using the make_per_engine() helper method.
+        created using the create_metric_per_engine() helper method.
         """
         raise NotImplementedError
 
 
-class KVConnectorPrometheus:
+class KVConnectorProm:
     """
     Support for registering per-connector Prometheus metrics, and
     recording transfer statistics to those metrics. Uses

@@ -14,8 +14,6 @@ import typing
 import vllm.env_override  # noqa: F401
 
 MODULE_ATTRS = {
-    "bc_linter_skip": "._bc_linter:bc_linter_skip",
-    "bc_linter_include": "._bc_linter:bc_linter_include",
     "AsyncEngineArgs": ".engine.arg_utils:AsyncEngineArgs",
     "EngineArgs": ".engine.arg_utils:EngineArgs",
     "AsyncLLMEngine": ".engine.async_llm_engine:AsyncLLMEngine",
@@ -62,8 +60,6 @@ if typing.TYPE_CHECKING:
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.v1.executor.ray_utils import initialize_ray_cluster
-
-    from ._bc_linter import bc_linter_include, bc_linter_skip
 else:
 
     def __getattr__(name: str) -> typing.Any:
@@ -79,8 +75,6 @@ else:
 
 __all__ = [
     "__version__",
-    "bc_linter_skip",
-    "bc_linter_include",
     "__version_tuple__",
     "LLM",
     "ModelRegistry",
@@ -106,36 +100,40 @@ __all__ = [
     "PoolingParams",
 ]
 
-# FP8 per-tensor no-transpose patch for weight sync compatibility
+# FP8 per-tensor no-transpose patch for weight sync compatibility.
+# Stores FP8 weights as [out, in] (instead of vLLM's default [in, out]) so they
+# can be batch-synced from a BF16 FSDP trainer; the on-the-fly .t() at kernel
+# entry preserves the compute layout expected by ScaledMM.
 import os as _os
+
 if _os.environ.get("SKYRL_FUSE_WEIGHTS") == "1":
     try:
-        from vllm.model_executor.layers.quantization.fp8 import Fp8LinearMethod as _Fp8LM
+        from vllm.model_executor.layers.quantization.fp8 import (
+            Fp8LinearMethod as _Fp8LM,
+        )
         _orig_process = _Fp8LM.process_weights_after_loading
 
         def _patched_process(self, layer, *args, **kwargs):
-            # Save param attributes before FP8 processing
             _saved = {}
             for _pn, _p in layer.named_parameters():
-                _a = {'subclass_type': type(_p)}
-                for _attr in ('weight_loader', 'output_dim', 'input_dim',
-                              '_output_dim', '_input_dim', 'packed_dim',
-                              'packed_factor', 'tp_rank', 'tp_size'):
+                _a = {"subclass_type": type(_p)}
+                for _attr in (
+                    "weight_loader", "output_dim", "input_dim",
+                    "_output_dim", "_input_dim", "packed_dim",
+                    "packed_factor", "tp_rank", "tp_size",
+                ):
                     if hasattr(_p, _attr):
                         _a[_attr] = getattr(_p, _attr)
                 _saved[_pn] = _a
 
-            # Run original (quantize + transpose)
             _result = _orig_process(self, layer, *args, **kwargs)
 
-            # Un-transpose the weight back to [out, in] for weight sync compat
-            # The apply() method will transpose on-the-fly
-            if hasattr(layer, 'weight') and layer.weight.data.dim() == 2:
-                import torch
-                layer.weight = torch.nn.Parameter(
-                    layer.weight.data.t().contiguous(), requires_grad=False)
+            if hasattr(layer, "weight") and layer.weight.data.dim() == 2:
+                import torch as _torch
+                layer.weight = _torch.nn.Parameter(
+                    layer.weight.data.t().contiguous(), requires_grad=False
+                )
 
-            # Restore attributes
             for _pn, _p in layer.named_parameters():
                 if _pn in _saved:
                     for _attr, _val in _saved[_pn].items():
@@ -146,11 +144,28 @@ if _os.environ.get("SKYRL_FUSE_WEIGHTS") == "1":
             return _result
 
         _Fp8LM.process_weights_after_loading = _patched_process
+
+        # Upstream now reads layer.weight inside the kernel via
+        # FP8ScaledMMLinearKernel._get_layer_params(); transpose there so the
+        # kernel sees the [in, out] layout it expects.
+        from vllm.model_executor.kernels.linear.scaled_mm.ScaledMMLinearKernel import (
+            FP8ScaledMMLinearKernel as _FP8K,
+        )
+        _orig_get_params = _FP8K._get_layer_params
+
+        def _patched_get_params(self, layer):
+            _params = _orig_get_params(self, layer)
+            _w = _params[0]
+            if _w is not None and _w.dim() == 2:
+                return (_w.t(),) + tuple(_params[1:])
+            return _params
+
+        _FP8K._get_layer_params = _patched_get_params
     except Exception as _e:
         import warnings as _w
         _w.warn(f"FP8 no-transpose patch failed: {_e}")
 
-# FlashRL FP8 patch - auto-activate when FLASHRL_CONFIG is set
+# FlashRL FP8 patch - auto-activate when FLASHRL_CONFIG is set.
 if _os.environ.get("FLASHRL_CONFIG"):
     try:
         from vllm.model_executor.layers.patch import apply_patch as _apply_flashrl
@@ -158,4 +173,3 @@ if _os.environ.get("FLASHRL_CONFIG"):
     except Exception as _e:
         import warnings as _w
         _w.warn(f"FlashRL patch failed: {_e}")
-

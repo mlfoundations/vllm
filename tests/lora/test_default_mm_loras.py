@@ -11,8 +11,10 @@ import pytest
 from huggingface_hub import snapshot_download
 
 from vllm.lora.request import LoRARequest
+from vllm.platforms import current_platform
 
 from ..conftest import AudioTestAssets, VllmRunner
+from ..utils import create_new_process_for_each_test
 
 MODEL_PATH = snapshot_download("microsoft/Phi-4-multimodal-instruct")
 AUDIO_LORA_PATH = os.path.join(MODEL_PATH, "speech-lora")
@@ -60,6 +62,7 @@ def run_test(vllm_runner, audio_assets, lora_request, expected_suffix, **kwargs)
         assert vllm_outputs_with_default_lora[-1][-1][-1].endswith(expected_suffix)
 
 
+@create_new_process_for_each_test()
 def test_active_default_mm_lora(
     vllm_runner: type[VllmRunner],
     audio_assets: AudioTestAssets,
@@ -74,6 +77,10 @@ def test_active_default_mm_lora(
     )
 
 
+@pytest.mark.skipif(
+    current_platform.is_cuda_alike(), reason="Skipping to avoid redundant model tests"
+)
+@create_new_process_for_each_test()
 def test_inactive_default_mm_lora(
     vllm_runner: type[VllmRunner],
     audio_assets: AudioTestAssets,
@@ -89,6 +96,10 @@ def test_inactive_default_mm_lora(
     )
 
 
+@pytest.mark.skipif(
+    current_platform.is_cuda_alike(), reason="Skipping to avoid redundant model tests"
+)
+@create_new_process_for_each_test()
 def test_default_mm_lora_succeeds_with_redundant_lora_request(
     vllm_runner: type[VllmRunner],
     audio_assets: AudioTestAssets,
@@ -103,6 +114,10 @@ def test_default_mm_lora_succeeds_with_redundant_lora_request(
     )
 
 
+@pytest.mark.skipif(
+    current_platform.is_cuda_alike(), reason="Skipping to avoid redundant model tests"
+)
+@create_new_process_for_each_test()
 def test_default_mm_lora_fails_with_overridden_lora_request(
     vllm_runner: type[VllmRunner],
     audio_assets: AudioTestAssets,
@@ -118,6 +133,7 @@ def test_default_mm_lora_fails_with_overridden_lora_request(
     )
 
 
+@create_new_process_for_each_test()
 def test_default_mm_lora_does_not_expand_string_reqs(vllm_runner):
     class MockEngineException(Exception):
         pass
@@ -147,5 +163,5 @@ def test_default_mm_lora_does_not_expand_string_reqs(vllm_runner):
         # Then check to make sure the submitted lora request
         # and text prompt were zipped together correctly
         engine_args, engine_kwargs = mock_add_request.call_args
+        assert engine_args[1]["prompt"] == AUDIO_PROMPT
         assert engine_kwargs["lora_request"] is None
-        assert engine_kwargs["prompt_text"] == AUDIO_PROMPT

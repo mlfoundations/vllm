@@ -140,8 +140,8 @@ class LlamaModel(nn.Module):
                 weight_loader(param, loaded_weight)
                 loaded_params.add(scale_name)
                 continue
-            # Remapping the name FP8 kv-scale
-            if "scale" in name:
+            # Remapping the name FP8 kv-scale or zero point.
+            if "scale" in name or "zero_point" in name:
                 name = maybe_remap_kv_scale_name(name, params_dict)
                 if name is None:
                     continue
@@ -174,7 +174,9 @@ class EagleLlamaForCausalLM(LlamaForCausalLM):
             vllm_config.parallel_config
         )
         self.model = LlamaModel(
-            vllm_config=vllm_config, prefix="model", start_layer_id=target_layer_num
+            vllm_config=vllm_config,
+            prefix=maybe_prefix(prefix, "model"),
+            start_layer_id=target_layer_num,
         )
 
         logit_scale = getattr(self.config, "logit_scale", 1.0)
